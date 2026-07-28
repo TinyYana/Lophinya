@@ -1,0 +1,335 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: TinyYana <yanasakuranight@gmail.com>
+Date: Tue, 28 Jul 2026 14:50:24 +0800
+Subject: [PATCH] Lophinya: generic plugin scheduler dispatch (GriefPrevention
+ as first rule set)
+
+Refactors the GriefPrevention-specific dispatch into LophinyaPluginSchedulerDispatch,
+a generic SHA-256-keyed rule table: {className, strategy, playerField} entries,
+one list per exact plugin jar version. Adding a future plugin's dispatch becomes a
+declarative rule entry after its own callsite research, not a bespoke Java class -
+the mechanical wiring is now shared, the per-plugin verification step is not (and
+should never be) removed.
+
+Three strategies cover everything found in GriefPrevention's research so far:
+GLOBAL (no single player/location context), GLOBAL_OR_PLAYER_FIELD (two variants
+of one class distinguished by a reflected Player field's nullness), PLAYER_FIELD
+(always a single known player). Repeat-vs-one-shot is derived generically from the
+task's period rather than hardcoded per rule.
+
+Same GriefPrevention 16.18.7 entry as before (4 classes), same fail-closed
+reflection handling, same per-plugin task-cancellation-on-disable tracking.
+
+Kill switch renamed: -Dlophinya.compat.pluginSchedulerDispatch=true (default off).
+
+diff --git a/src/main/java/fun/bm/lophinya/compat/LophinyaPluginSchedulerDispatch.java b/src/main/java/fun/bm/lophinya/compat/LophinyaPluginSchedulerDispatch.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..d6b92e14072fac71674c7755eb639ad51badbcfd
+--- /dev/null
++++ b/src/main/java/fun/bm/lophinya/compat/LophinyaPluginSchedulerDispatch.java
+@@ -0,0 +1,264 @@
++package fun.bm.lophinya.compat;
++
++import com.mojang.logging.LogUtils;
++import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
++import org.bukkit.Bukkit;
++import org.bukkit.craftbukkit.scheduler.CraftTask;
++import org.bukkit.entity.Player;
++import org.bukkit.plugin.Plugin;
++import org.slf4j.Logger;
++
++import java.lang.reflect.Field;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.security.MessageDigest;
++import java.util.HexFormat;
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.CopyOnWriteArrayList;
++
++/**
++ * Lophinya: generic, table-driven scheduler redispatch for plugins whose {@code onEnable()} (or
++ * later runtime behavior) is blocked by a sync scheduler call Folia rejects outright.
++ *
++ * <h2>What this is, precisely</h2>
++ * A registry of {@link Rule}s, keyed by the exact SHA-256 of one plugin jar. Each rule says
++ * "when THIS exact task class is about to be rejected, dispatch it THIS way instead" - either to
++ * {@link io.papermc.paper.threadedregions.scheduler.GlobalRegionScheduler} (for tasks with no
++ * single player/location context) or to a specific player's own
++ * {@link io.papermc.paper.threadedregions.scheduler.EntityScheduler} (read via reflection on a
++ * named field, for tasks scoped to exactly one known player).
++ *
++ * <h2>What this is <b>not</b></h2>
++ * This is <b>not</b> a general "route any rejected sync task to GlobalRegionScheduler" shim - that
++ * idea was tested and rejected (project-docs {@code CORE_COMPAT_INVESTIGATION.md}, {@code DEC-05}'s
++ * S-3): a bytecode scan of all 35 s01 plugins found it would fully unlock exactly one of them,
++ * because almost every plugin's sync scheduler calls are a mix of genuinely-global tasks and
++ * tasks that implicitly assume they're running on a specific region's thread. Blindly relocating
++ * the second kind doesn't make it safe - it either still fails somewhere inside, or worse, silently
++ * touches state from the wrong thread if some code path doesn't hit an explicit ownership check.
++ * <p>
++ * What actually distinguishes a safe rule from an unsafe guess is that <b>a human (or an agent,
++ * under the same evidentiary bar) read the real source of that exact class</b> and confirmed it
++ * has no such implicit assumption - see the evidence file cited next to each entry in
++ * {@link #RULES}. Adding a plugin here without that research is exactly the mistake this design
++ * exists to prevent; the table only makes the <i>mechanical</i> part (wiring a verified rule into
++ * the scheduler) cheap to repeat, not the verification itself.
++ * <p>
++ * Every rule is also version-locked to one exact jar SHA-256 - a plugin update requires a new
++ * entry with fresh research, never inherits the previous version's rules.
++ *
++ * <h2>Fail-closed by construction</h2>
++ * Any reflection failure (a field renamed/removed upstream) makes {@link #tryDispatch} return
++ * {@code null} - the call falls through to stock Folia rejection, exactly as if no rule existed.
++ * This class never guesses; an unreadable field means "unknown," not "assume the safe case."
++ *
++ * <h2>Cleanup on plugin disable</h2>
++ * Every task this class successfully reschedules is tracked per-plugin and cancelled by
++ * {@link #cancelAll(Plugin)}, called from the same plugin-disable hook patch 0024 added for the
++ * restored async scheduler - otherwise a disabled plugin's redispatched tasks would keep running
++ * forever, the same bug class that hardening round fixed for async tasks ({@code DEC-17}).
++ *
++ * <p>Kill switch: {@code -Dlophinya.compat.pluginSchedulerDispatch=true} - defaults to
++ * <b>off</b>. This mechanism reflects into third-party plugin internals; it should never be a
++ * silent default.
++ */
++public final class LophinyaPluginSchedulerDispatch {
++
++    private static final Logger LOGGER = LogUtils.getLogger();
++
++    public static final boolean ENABLED =
++        "true".equalsIgnoreCase(System.getProperty("lophinya.compat.pluginSchedulerDispatch", "false"));
++
++    /** How to redispatch a matched task. */
++    public enum Strategy {
++        /** No single player/location context - always dispatch to the global region. */
++        GLOBAL,
++        /**
++         * Two variants of one class, distinguished only by a reflected {@link Player} field's
++         * value: {@code null} means the global-scope variant, non-null means a single known
++         * player - dispatched to that player's own scheduler.
++         */
++        GLOBAL_OR_PLAYER_FIELD,
++        /** Always a single known player (the field is never null for this class) - dispatched to that player's own scheduler. */
++        PLAYER_FIELD
++    }
++
++    /**
++     * @param className    fully-qualified name of the task class this rule matches
++     * @param strategy     how to dispatch a match
++     * @param playerField  name of the reflected {@link Player} field (required for
++     *                     {@link Strategy#GLOBAL_OR_PLAYER_FIELD} and {@link Strategy#PLAYER_FIELD}, unused for {@link Strategy#GLOBAL})
++     */
++    public record Rule(String className, Strategy strategy, String playerField) {
++        public Rule(final String className, final Strategy strategy) {
++            this(className, strategy, null);
++        }
++    }
++
++    /**
++     * One entry per (plugin, exact jar SHA-256). Each {@link Rule} list is the product of reading
++     * that plugin's real official source (not decompiled) and confirming the dispatch target
++     * doesn't guess at region ownership - see the cited evidence file for the actual research.
++     */
++    private static final Map<String, List<Rule>> RULES = Map.of(
++        // GriefPrevention 16.18.7 (s01-installed version). Research:
++        // evidence/20260728-t09-griefprevention-callsite-analysis.md,
++        // evidence/20260728-t09b-griefprevention-per-callsite-dispatch-feasibility.md,
++        // evidence/20260728-griefprevention-core-shim-implementation-plan.md.
++        // SiegeCheckupTask and CleanupUnusedClaimPreTask->CleanupUnusedClaimTask are deliberately
++        // NOT here - both need a genuine redesign (two-hop dispatch; chunk-scoped handoff) that
++        // this Strategy set can't express safely, not a rule of this shape.
++        "45E9907C61222E559ED2E099FFEE0EDE706A21243A31D7DB549BAF678708FDF0", List.of(
++            new Rule("me.ryanhamshire.GriefPrevention.EntityCleanupTask", Strategy.GLOBAL),
++            new Rule("me.ryanhamshire.GriefPrevention.FindUnusedClaimsTask", Strategy.GLOBAL),
++            new Rule("me.ryanhamshire.GriefPrevention.DeliverClaimBlocksTask", Strategy.GLOBAL_OR_PLAYER_FIELD, "player"),
++            new Rule("me.ryanhamshire.GriefPrevention.PvPImmunityValidationTask", Strategy.PLAYER_FIELD, "player")
++        )
++    );
++
++    private static final Map<Path, String> SHA_CACHE = new ConcurrentHashMap<>();
++    private static final Map<Plugin, List<ScheduledTask>> DISPATCHED = new ConcurrentHashMap<>();
++
++    private LophinyaPluginSchedulerDispatch() {
++    }
++
++    /**
++     * @param task   the task about to be rejected by stock Folia's {@code CraftScheduler.handle}
++     * @param delay  the delay in ticks, as passed to {@code handle}
++     * @param period the task's period ({@code CraftTask.getPeriod()} is package-private to
++     *               {@code org.bukkit.craftbukkit.scheduler}, so the caller passes it through);
++     *               {@code > 0} is treated as repeating, anything else (stock Folia's
++     *               {@code NO_REPEATING = -1}) as one-shot
++     * @return the same task (already scheduled), or {@code null} if no rule matches and the call
++     *         should fall through to the normal rejection path
++     */
++    public static CraftTask tryDispatch(final CraftTask task, final long delay, final long period) {
++        if (!ENABLED) {
++            return null;
++        }
++        try {
++            final Plugin plugin = task.getOwner();
++            if (plugin == null || task.rTask == null) {
++                return null;
++            }
++            final List<Rule> rules = RULES.get(sha256(plugin));
++            if (rules == null) {
++                return null;
++            }
++
++            final String className = task.rTask.getClass().getName();
++            Rule matched = null;
++            for (final Rule r : rules) {
++                if (r.className().equals(className)) {
++                    matched = r;
++                    break;
++                }
++            }
++            if (matched == null) {
++                return null;
++            }
++
++            final boolean repeating = period > 0;
++            final long safeDelay = Math.max(delay, 1L);
++            final ScheduledTask scheduled;
++
++            if (matched.strategy() == Strategy.GLOBAL) {
++                scheduled = repeating
++                    ? Bukkit.getGlobalRegionScheduler().runAtFixedRate(plugin, ignored -> task.run(), safeDelay, period)
++                    : Bukkit.getGlobalRegionScheduler().runDelayed(plugin, ignored -> task.run(), safeDelay);
++            } else {
++                // GLOBAL_OR_PLAYER_FIELD or PLAYER_FIELD - both need the reflected field first.
++                // Fail closed on any reflection trouble: an unreadable field is "unknown", not
++                // "assume the safe case".
++                final PlayerFieldResult pf = readPlayerField(task.rTask, matched.playerField());
++                if (!pf.readable()) {
++                    return null;
++                }
++                if (pf.player() == null) {
++                    if (matched.strategy() == Strategy.PLAYER_FIELD) {
++                        // This strategy requires a non-null player; null here means this call
++                        // doesn't actually match the researched case after all.
++                        return null;
++                    }
++                    scheduled = repeating
++                        ? Bukkit.getGlobalRegionScheduler().runAtFixedRate(plugin, ignored -> task.run(), safeDelay, period)
++                        : Bukkit.getGlobalRegionScheduler().runDelayed(plugin, ignored -> task.run(), safeDelay);
++                } else {
++                    final ScheduledTask s = repeating
++                        ? pf.player().getScheduler().runAtFixedRate(plugin, ignored -> task.run(), null, safeDelay, period)
++                        : pf.player().getScheduler().runDelayed(plugin, ignored -> task.run(), null, safeDelay);
++                    if (s == null) {
++                        // Entity already invalid/removed by schedule time - not an error, the
++                        // per-player task simply has nothing to do.
++                        return task;
++                    }
++                    scheduled = s;
++                }
++            }
++
++            DISPATCHED.computeIfAbsent(plugin, p -> new CopyOnWriteArrayList<>()).add(scheduled);
++            LOGGER.warn("[Lophinya] {}: redispatched {} ({}, delay={}, period={}) - version-locked "
++                + "rule table entry, not a general sync-to-global shim",
++                plugin.getName(), className, matched.strategy(), delay, period);
++            return task;
++        } catch (final Throwable t) {
++            // ponytail: any failure here must fall through to stock rejection, never silently
++            // "succeed" without actually having scheduled anything.
++            LOGGER.warn("[Lophinya] plugin scheduler dispatch failed (falling through to stock rejection)", t);
++            return null;
++        }
++    }
++
++    /** Called from the plugin-disable path so a disabled plugin's redispatched tasks stop running. */
++    public static void cancelAll(final Plugin plugin) {
++        final List<ScheduledTask> tasks = DISPATCHED.remove(plugin);
++        if (tasks == null) {
++            return;
++        }
++        for (final ScheduledTask t : tasks) {
++            try {
++                t.cancel();
++            } catch (final Throwable ignored) {
++            }
++        }
++    }
++
++    private static String sha256(final Plugin plugin) {
++        try {
++            final Path jarPath = Path.of(plugin.getClass().getProtectionDomain().getCodeSource().getLocation().toURI());
++            return SHA_CACHE.computeIfAbsent(jarPath, LophinyaPluginSchedulerDispatch::hash);
++        } catch (final Throwable t) {
++            return "<unreadable>";
++        }
++    }
++
++    private static String hash(final Path jarPath) {
++        try {
++            final MessageDigest md = MessageDigest.getInstance("SHA-256");
++            return HexFormat.of().withUpperCase().formatHex(md.digest(Files.readAllBytes(jarPath)));
++        } catch (final Throwable t) {
++            return "<unreadable>";
++        }
++    }
++
++    /**
++     * Reads a named {@link Player} field via reflection. {@code readable=false} means reflection
++     * failed (renamed/removed field upstream) - callers must treat that as "unknown, do not
++     * guess" and fall through to stock rejection, not assume any particular variant.
++     */
++    private static PlayerFieldResult readPlayerField(final Runnable rTask, final String fieldName) {
++        try {
++            final Field f = rTask.getClass().getDeclaredField(fieldName);
++            f.setAccessible(true);
++            final Object value = f.get(rTask);
++            return new PlayerFieldResult(true, (value instanceof Player p) ? p : null);
++        } catch (final Throwable t) {
++            return new PlayerFieldResult(false, null);
++        }
++    }
++
++    private record PlayerFieldResult(boolean readable, Player player) {
++    }
++}
+diff --git a/src/main/java/io/papermc/paper/plugin/manager/PaperPluginInstanceManager.java b/src/main/java/io/papermc/paper/plugin/manager/PaperPluginInstanceManager.java
+index d01d2e69974f5af5350a684aaac7d1ce25b3782f..177699655ee4a993cc9e55241367e322dd201d16 100644
+--- a/src/main/java/io/papermc/paper/plugin/manager/PaperPluginInstanceManager.java
++++ b/src/main/java/io/papermc/paper/plugin/manager/PaperPluginInstanceManager.java
+@@ -274,6 +274,15 @@ class PaperPluginInstanceManager {
+         }
+         // Lophinya end - restored async scheduler: cancel Bukkit tasks on disable, like Paper does
+ 
++        // Lophinya start - generic plugin scheduler redispatch: cancel any tasks this plugin had
++        // redispatched via LophinyaPluginSchedulerDispatch, same reasoning as the block above -
++        // otherwise a disabled plugin's redispatched tasks would keep running forever.
++        try {
++            fun.bm.lophinya.compat.LophinyaPluginSchedulerDispatch.cancelAll(plugin);
++        } catch (Throwable ignored) {
++        }
++        // Lophinya end - generic plugin scheduler redispatch
++
+         // Paper start - Folia schedulers
+         try {
+             this.server.getGlobalRegionScheduler().cancelTasks(plugin);
+diff --git a/src/main/java/org/bukkit/craftbukkit/scheduler/CraftScheduler.java b/src/main/java/org/bukkit/craftbukkit/scheduler/CraftScheduler.java
+index 8d094c0afe74b199500f3e8a23ce13d9abf86061..d04c18ac71e6419f7e4fafe9c010470b59a95f84 100644
+--- a/src/main/java/org/bukkit/craftbukkit/scheduler/CraftScheduler.java
++++ b/src/main/java/org/bukkit/craftbukkit/scheduler/CraftScheduler.java
+@@ -550,6 +550,16 @@ public class CraftScheduler implements BukkitScheduler {
+             this.addTask(task);
+             return task;
+         }
++        // Lophinya start - generic plugin scheduler redispatch (opt-in, see
++        // LophinyaPluginSchedulerDispatch for scope and rationale). Only reached for sync tasks on
++        // the main (non-async) scheduler - exactly the case stock Folia has no home for.
++        if (!this.isAsyncScheduler && task.isSync()) {
++            final CraftTask redispatched = fun.bm.lophinya.compat.LophinyaPluginSchedulerDispatch.tryDispatch(task, delay, task.getPeriod());
++            if (redispatched != null) {
++                return redispatched;
++            }
++        }
++        // Lophinya end - generic plugin scheduler redispatch
+         throw new UnsupportedOperationException(fun.bm.lophinya.compat.LophinyaSchedulerDiagnostics.reportRejected(
+             task.getOwner(), delay, task.getPeriod(), !task.isSync()));
+         // Lophinya end - restore Bukkit async scheduler semantics + diagnostic guard
