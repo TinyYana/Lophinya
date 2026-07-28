@@ -31,10 +31,10 @@ Kill switch: -Dlophinya.compat.foliaSupportedAllowlist=false
 
 diff --git a/src/main/java/fun/bm/lophinya/compat/LophinyaFoliaSupportedAllowlist.java b/src/main/java/fun/bm/lophinya/compat/LophinyaFoliaSupportedAllowlist.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..05c166b0f7fd46873c74780a2e038106e0fb9dd6
+index 0000000000000000000000000000000000000000..3a19539cc9929e4afa34d9395d83c9a8d6c8b73e
 --- /dev/null
 +++ b/src/main/java/fun/bm/lophinya/compat/LophinyaFoliaSupportedAllowlist.java
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,130 @@
 +package fun.bm.lophinya.compat;
 +
 +import com.mojang.logging.LogUtils;
@@ -104,7 +104,17 @@ index 0000000000000000000000000000000000000000..05c166b0f7fd46873c74780a2e038106
 +        // console/teleport action), each with a single known Player at the point of scheduling -
 +        // see evidence/20260728-decenthollograms-core-shim-implementation-plan.md for the
 +        // per-callsite dispatch design (not yet implemented as of this entry).
-+        "E247B7362C277DAD0596CB48B5D1570B1002FBA014A5AFD8458D978963A253B4", "DecentHolograms 2.10.1"
++        "E247B7362C277DAD0596CB48B5D1570B1002FBA014A5AFD8458D978963A253B4", "DecentHolograms 2.10.1",
++        // Shopkeepers 2.27.0 (s01-installed version). No official Folia path (maintainer rejected
++        // upstream PR #1017). Core-shim research (evidence/20260728-t12-shopkeepers-callsite-
++        // analysis.md) found, unlike DecentHolograms, that onEnable() DOES call two unconditional
++        // sync scheduler registrations (ShopkeeperSpawner.onEnable(), ShopkeeperTicker.onEnable())
++        // with no try/catch - so passing the gate alone is expected to still fail onEnable() at
++        // whichever of those two fires first, same shape of problem GriefPrevention had before its
++        // scheduler dispatch rules existed. Added here specifically to empirically confirm that
++        // prediction (gate-only test, no dispatch rules yet for this plugin), not because the gate
++        // alone is expected to make it boot.
++        "4481DF8E0B5642A2835150103E951F0BB360B8158E33C2151781B3BD4A7260A4", "Shopkeepers 2.27.0"
 +    );
 +
 +    /** SHA-256 of a jar is stable for the run; hashing it on every plugin-load check is wasteful. */
