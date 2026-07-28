@@ -34,16 +34,17 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
 diff --git a/src/main/java/fun/bm/lophinya/compat/LophinyaGriefPreventionCompat.java b/src/main/java/fun/bm/lophinya/compat/LophinyaGriefPreventionCompat.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..871f9ddb917db89039b008628067d925bf673041
+index 0000000000000000000000000000000000000000..491edece82899c448635df295f8ecb251a907786
 --- /dev/null
 +++ b/src/main/java/fun/bm/lophinya/compat/LophinyaGriefPreventionCompat.java
-@@ -0,0 +1,184 @@
+@@ -0,0 +1,233 @@
 +package fun.bm.lophinya.compat;
 +
 +import com.mojang.logging.LogUtils;
 +import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 +import org.bukkit.Bukkit;
 +import org.bukkit.craftbukkit.scheduler.CraftTask;
++import org.bukkit.entity.Player;
 +import org.bukkit.plugin.Plugin;
 +import org.slf4j.Logger;
 +
@@ -68,26 +69,40 @@ index 0000000000000000000000000000000000000000..871f9ddb917db89039b008628067d925
 + * rest of {@code onEnable()} before any of its 68 {@code @EventHandler}s (the actual claim
 + * protection logic) get registered.
 + *
-+ * <p>This redispatches exactly three named, version-locked task classes to
-+ * {@link io.papermc.paper.threadedregions.scheduler.GlobalRegionScheduler} - the same three whose
-+ * scheduling call sits directly in {@code onEnable()} and would otherwise block it:
++ * <p>This redispatches four named, version-locked task classes, each individually verified
++ * against the real official GriefPrevention 16.18.7 source (not decompiled):
 + * <ul>
-+ *   <li>{@code DeliverClaimBlocksTask} (only its {@code player == null} fan-out variant - it has no
-+ *       single player/location context at schedule time, so {@code GlobalRegionScheduler} is the
-+ *       correct target, not a guess at region ownership; see B1/B2 boundary discussion in
-+ *       {@code DECISIONS.md} DEC-19)</li>
-+ *   <li>{@code EntityCleanupTask} (schedule-only fix - its own cleanup logic still touches
-+ *       world-wide entity state from the global region and is expected to fail/no-op on its first
++ *   <li>{@code DeliverClaimBlocksTask} - has two variants distinguished only by its private
++ *       {@code player} field's value: {@code null} is a fan-out task with no single
++ *       player/location context (dispatched to {@link io.papermc.paper.threadedregions.scheduler.GlobalRegionScheduler});
++ *       non-null is a single known player, scheduled one tick apart from inside the fan-out
++ *       task's own {@code run()} (dispatched to that player's
++ *       {@link io.papermc.paper.threadedregions.scheduler.EntityScheduler}). Neither is a guess at
++ *       region ownership; see B1/B2 boundary discussion in {@code DECISIONS.md} DEC-19</li>
++ *   <li>{@code EntityCleanupTask} (schedule-only fix, global region - its own cleanup logic still
++ *       touches world-wide entity state and is expected to fail/no-op on its first
 + *       non-global-owned touch; this is a known, accepted degradation, not something this class
 + *       tries to fix)</li>
-+ *   <li>{@code FindUnusedClaimsTask} (its {@code run()} already only fans out via
++ *   <li>{@code FindUnusedClaimsTask} (global region - its {@code run()} already only fans out via
 + *       {@code runTaskAsynchronously}, which patch 0024 already restored)</li>
++ *   <li>{@code PvPImmunityValidationTask} (single known player for its whole lifetime, dispatched
++ *       to that player's {@code EntityScheduler})</li>
 + * </ul>
 + *
++ * <p><b>Not yet handled</b> (see project-docs
++ * {@code evidence/20260728-griefprevention-core-shim-implementation-plan.md} §2.4/§2.5):
++ * {@code SiegeCheckupTask} needs a genuine two-hop redesign (it reads both an attacker's and a
++ * defender's location in one {@code run()}, which can span two regions - simply relocating the
++ * whole call is not safe), and the
++ * {@code CleanupUnusedClaimPreTask}→{@code CleanupUnusedClaimTask} handoff needs chunk-scoped
++ * dispatch via {@code claim.getChunks()} that the proposal itself flags as an open design
++ * question. Both fall through to stock rejection for now - logged, not fatal.
++ *
 + * <p>This is <b>not</b> a general "route sync tasks to GlobalRegionScheduler" shim (that is
-+ * exactly {@code DEC-05}'s S-3, explicitly rejected) - it is a hard-coded allow-list of three
-+ * specific classes from one version-locked jar, verified against the real official GriefPrevention
-+ * 16.18.7 source (not decompiled) to have no single-region context requirement.
++ * exactly {@code DEC-05}'s S-3, explicitly rejected) - it is a hard-coded allow-list of specific
++ * classes from one version-locked jar, each individually confirmed to have no single-region
++ * context requirement (or, for the per-player variants, dispatched to that exact player's own
++ * scheduler rather than the global one).
 + *
 + * <p>Tasks dispatched here are tracked so they can be cancelled when the plugin is disabled -
 + * {@link #cancelAll(Plugin)} is called from the same disable hook patch 0024 added for the
@@ -112,6 +127,7 @@ index 0000000000000000000000000000000000000000..871f9ddb917db89039b008628067d925
 +    private static final String DELIVER_CLAIM_BLOCKS_TASK = "me.ryanhamshire.GriefPrevention.DeliverClaimBlocksTask";
 +    private static final String ENTITY_CLEANUP_TASK = "me.ryanhamshire.GriefPrevention.EntityCleanupTask";
 +    private static final String FIND_UNUSED_CLAIMS_TASK = "me.ryanhamshire.GriefPrevention.FindUnusedClaimsTask";
++    private static final String PVP_IMMUNITY_VALIDATION_TASK = "me.ryanhamshire.GriefPrevention.PvPImmunityValidationTask";
 +
 +    private static final Map<Path, String> SHA_CACHE = new ConcurrentHashMap<>();
 +    private static final Map<Plugin, List<ScheduledTask>> DISPATCHED = new ConcurrentHashMap<>();
@@ -146,15 +162,45 @@ index 0000000000000000000000000000000000000000..871f9ddb917db89039b008628067d925
 +            } else if (FIND_UNUSED_CLAIMS_TASK.equals(className)) {
 +                scheduled = Bukkit.getGlobalRegionScheduler()
 +                    .runAtFixedRate(plugin, ignored -> task.run(), Math.max(delay, 1L), Math.max(period, 1L));
-+            } else if (DELIVER_CLAIM_BLOCKS_TASK.equals(className) && isNullPlayerVariant(task.rTask)) {
-+                // Only the player==null fan-out variant reaches here from onEnable(). The
-+                // per-player variant (player != null) is scheduled later, one tick apart, from
-+                // inside this task's own run() - by then it is a single-known-player context, but
-+                // redispatching *that* variant is not yet implemented, so it still falls through
-+                // to stock rejection (logged, not fatal - see evidence/20260728-core-patch-0025-*
-+                // for why a rejected mid-run scheduler call doesn't crash the plugin).
-+                scheduled = Bukkit.getGlobalRegionScheduler()
-+                    .runAtFixedRate(plugin, ignored -> task.run(), Math.max(delay, 1L), Math.max(period, 1L));
++            } else if (DELIVER_CLAIM_BLOCKS_TASK.equals(className)) {
++                // Two variants of the same class, distinguished only by the private `player`
++                // field's value at construction time - both verified against real GriefPrevention
++                // 16.18.7 source. player == null: fan-out task, no single-player/location context,
++                // safe on the global region. player != null: single known player, scheduled one
++                // tick apart from inside the fan-out task's own run() - safe on that player's
++                // EntityScheduler. Reflection failure means "unknown", not "assume global" - fail
++                // closed to stock rejection rather than guess.
++                final PlayerFieldResult pf = readPlayerField(task.rTask);
++                if (!pf.readable()) {
++                    return null;
++                }
++                if (pf.player() == null) {
++                    scheduled = Bukkit.getGlobalRegionScheduler()
++                        .runAtFixedRate(plugin, ignored -> task.run(), Math.max(delay, 1L), Math.max(period, 1L));
++                } else {
++                    final ScheduledTask s = pf.player().getScheduler()
++                        .runDelayed(plugin, ignored -> task.run(), null, Math.max(delay, 1L));
++                    if (s == null) {
++                        // Entity already invalid/removed by schedule time - not an error, the
++                        // per-player task simply has nothing to do.
++                        return task;
++                    }
++                    scheduled = s;
++                }
++            } else if (PVP_IMMUNITY_VALIDATION_TASK.equals(className)) {
++                // Single known player for the task's whole lifetime (constructor-only field,
++                // never null) - self-reschedules via the same call site, so this branch also
++                // handles its own repeat checks.
++                final PlayerFieldResult pf = readPlayerField(task.rTask);
++                if (!pf.readable() || pf.player() == null) {
++                    return null;
++                }
++                final ScheduledTask s = pf.player().getScheduler()
++                    .runDelayed(plugin, ignored -> task.run(), null, Math.max(delay, 1L));
++                if (s == null) {
++                    return task;
++                }
++                scheduled = s;
 +            } else {
 +                return null;
 +            }
@@ -206,20 +252,23 @@ index 0000000000000000000000000000000000000000..871f9ddb917db89039b008628067d925
 +    }
 +
 +    /**
-+     * @return true only if GriefPrevention's private {@code player} field could be read via
-+     *         reflection <b>and</b> its value is null (the fan-out/global variant). Any reflection
-+     *         failure (renamed/removed field upstream) returns false - fail closed, so an upstream
-+     *         refactor silently disables this branch instead of silently misclassifying a
-+     *         single-player task as the global one.
++     * Reads a class's private {@code player} field (the name both {@code DeliverClaimBlocksTask}
++     * and {@code PvPImmunityValidationTask} happen to use). {@code readable=false} means
++     * reflection failed (renamed/removed field upstream) - callers must treat that as "unknown,
++     * do not guess" and fall through to stock rejection, not assume any particular variant.
 +     */
-+    private static boolean isNullPlayerVariant(final Runnable rTask) {
++    private static PlayerFieldResult readPlayerField(final Runnable rTask) {
 +        try {
 +            final Field f = rTask.getClass().getDeclaredField("player");
 +            f.setAccessible(true);
-+            return f.get(rTask) == null;
++            final Object value = f.get(rTask);
++            return new PlayerFieldResult(true, (value instanceof Player p) ? p : null);
 +        } catch (final Throwable t) {
-+            return false;
++            return new PlayerFieldResult(false, null);
 +        }
++    }
++
++    private record PlayerFieldResult(boolean readable, Player player) {
 +    }
 +}
 diff --git a/src/main/java/io/papermc/paper/plugin/manager/PaperPluginInstanceManager.java b/src/main/java/io/papermc/paper/plugin/manager/PaperPluginInstanceManager.java
