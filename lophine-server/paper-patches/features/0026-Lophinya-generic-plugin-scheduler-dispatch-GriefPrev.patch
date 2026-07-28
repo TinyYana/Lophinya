@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: TinyYana <yanasakuranight@gmail.com>
 Date: Tue, 28 Jul 2026 14:50:24 +0800
-Subject: [PATCH] Lophinya: generic plugin scheduler dispatch (GriefPrevention
- as first rule set)
+Subject: [PATCH] Lophinya: generic plugin scheduler dispatch (GriefPrevention,
+ Shopkeepers)
 
 Refactors the GriefPrevention-specific dispatch into LophinyaPluginSchedulerDispatch,
 a generic SHA-256-keyed rule table: {className, strategy, playerField} entries,
@@ -11,23 +11,52 @@ declarative rule entry after its own callsite research, not a bespoke Java class
 the mechanical wiring is now shared, the per-plugin verification step is not (and
 should never be) removed.
 
-Three strategies cover everything found in GriefPrevention's research so far:
-GLOBAL (no single player/location context), GLOBAL_OR_PLAYER_FIELD (two variants
-of one class distinguished by a reflected Player field's nullness), PLAYER_FIELD
-(always a single known player). Repeat-vs-one-shot is derived generically from the
-task's period rather than hardcoded per rule.
+Three strategies cover everything found so far: GLOBAL (no single player/location
+context), GLOBAL_OR_PLAYER_FIELD (two variants of one class distinguished by a
+reflected Player field's nullness), PLAYER_FIELD (always a single known player).
+Repeat-vs-one-shot is derived generically from the task's period rather than
+hardcoded per rule.
 
-Same GriefPrevention 16.18.7 entry as before (4 classes), same fail-closed
-reflection handling, same per-plugin task-cancellation-on-disable tracking.
+Rule set 1 - GriefPrevention 16.18.7, 4 classes, unchanged.
 
-Kill switch renamed: -Dlophinya.compat.pluginSchedulerDispatch=true (default off).
+Rule set 2 - Shopkeepers 2.27.0, 5 classes. These are exactly the five sync
+scheduler registrations that abort SKShopkeepersPlugin.onEnable() on stock Folia,
+found one at a time by re-running an isolated DevServer cold start after each rule
+and taking whatever the next runtime blocker turned out to be:
+
+  EntityAI$TickTask                              (EntityAI.java:383,      timer 3/3)
+  CitizensShops$DelayedSetupTask                 (CitizensShops.java:183, later 3)
+  ShopkeeperSpawnQueue$SpawnerTask               (TaskQueue.java:191,     timer 1/3)
+  ShopkeeperSpawner$CheckUnspawnableShopkeepersTask
+                                                 (ShopkeeperSpawner:99,   later 5)
+  ShopkeeperTicker$ShopkeeperTickTask            (ShopkeeperTicker:229,   timer 5/5)
+
+All five are named classes (not lambdas) and all five are whole-server scans or
+heartbeats with no single player/location context, so GLOBAL is the only honest
+target. Each one keeps its loop intact on one thread - nothing here fans a loop out
+per region, so the shared-static and batched-dirty-flag assumptions those loops make
+are exactly as valid as they are on Paper today.
+
+What this does NOT claim: Shopkeepers' entity shops do not work. Spawning happens
+from the global region, which owns no world chunks, so every spawn is rejected by
+the ownership check. onEnable() completing means commands and ~96 event handlers
+register - it is a C-BIN/C-SCHED result, not a working plugin. T-12's finding that
+EntityAI cannot be made correct across regions stands untouched.
+
+Deliberately NOT added: WorldSaveDespawner$RespawnShopkeepersAfterWorldSaveTask.
+Its scheduling call runs BEFORE despawnShopkeepersInWorld (WorldSaveDespawner.java:
+80-95), so letting it through would turn today's clean no-op (nothing despawned,
+nothing pending) into shopkeepers marked PENDING_WORLD_SAVE_RESPAWN with a respawn
+that cannot succeed. Rejecting it is the safer state.
+
+Kill switch: -Dlophinya.compat.pluginSchedulerDispatch=true (default off).
 
 diff --git a/src/main/java/fun/bm/lophinya/compat/LophinyaPluginSchedulerDispatch.java b/src/main/java/fun/bm/lophinya/compat/LophinyaPluginSchedulerDispatch.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..d6b92e14072fac71674c7755eb639ad51badbcfd
+index 0000000000000000000000000000000000000000..4bba3caaf3bbac238042f69f3db9ca57723dd609
 --- /dev/null
 +++ b/src/main/java/fun/bm/lophinya/compat/LophinyaPluginSchedulerDispatch.java
-@@ -0,0 +1,264 @@
+@@ -0,0 +1,334 @@
 +package fun.bm.lophinya.compat;
 +
 +import com.mojang.logging.LogUtils;
@@ -145,6 +174,76 @@ index 0000000000000000000000000000000000000000..d6b92e14072fac71674c7755eb639ad5
 +            new Rule("me.ryanhamshire.GriefPrevention.FindUnusedClaimsTask", Strategy.GLOBAL),
 +            new Rule("me.ryanhamshire.GriefPrevention.DeliverClaimBlocksTask", Strategy.GLOBAL_OR_PLAYER_FIELD, "player"),
 +            new Rule("me.ryanhamshire.GriefPrevention.PvPImmunityValidationTask", Strategy.PLAYER_FIELD, "player")
++        ),
++        // Shopkeepers 2.27.0 (s01-installed version). Research:
++        // evidence/20260728-t12-shopkeepers-callsite-analysis.md,
++        // evidence/20260728-t15-shopkeepers-entityai-scheduling-feasibility.md,
++        // evidence/20260728-shopkeepers-gate-only-l2-test.md (the L2 run that identified which
++        // callsite actually aborts onEnable()).
++        //
++        // EntityAI$TickTask is the AI/gravity heartbeat, registered unconditionally and without a
++        // try/catch from onEnable() (EntityAI.java:383 -> :225 -> BaseEntityShops:25 ->
++        // SKShopkeepersPlugin:398), so stock Folia's rejection kills the whole enable chain before
++        // any of the ~96 event handlers register. The scheduling call itself touches no world
++        // state, and the task body was read line by line against the official v2.27.0 source: it
++        // returns immediately while no shop entities are tracked, and once entities do exist it
++        // aborts at the first ownership check inside updateChunkActivations() - after the
++        // deactivate-everything pass, never mid-write. Same shape as GriefPrevention's
++        // EntityCleanupTask: the *dispatch* is safe, the *behaviour* is a known, documented
++        // degradation (shop gravity and look-at-player stop working once shops exist), not
++        // something this class pretends to fix.
++        //
++        // NOT a claim that Shopkeepers' AI subsystem works across regions - T-12 classified that
++        // as structurally infeasible (EntityAI.java:114-115 share static mutable Location/
++        // ChunkCoords across what would become several region threads) and this entry does not
++        // touch that conclusion. Nothing here re-dispatches per entity; the whole loop stays on
++        // one thread, so those shared statics keep exactly the single-threaded access pattern the
++        // plugin assumes.
++        //
++        // CitizensShops$DelayedSetupTask is the next abort in the same chain once EntityAI is
++        // handled (CitizensShops.java:183 -> :95 -> SKShopkeepersPlugin:402, runTaskLater delay=3,
++        // one-shot), reached only when Citizens is installed - which it is on s01. T-12 4.1/8-B
++        // classifies it as a global-but-one-shot startup scan. It has no player or location
++        // context at schedule time (it walks the whole shopkeeper registry), so GLOBAL is the only
++        // honest target. Its body reads the Citizens NPC registry and the plugin's own in-memory
++        // maps; with delete-invalid-citizen-shopkeepers defaulting to false (Settings.java:258,
++        // and s01's config does not override it) it mutates nothing outside those maps.
++        "4481DF8E0B5642A2835150103E951F0BB360B8158E33C2151781B3BD4A7260A4", List.of(
++            new Rule("com.nisovin.shopkeepers.shopobjects.entity.base.EntityAI$TickTask", Strategy.GLOBAL),
++            new Rule("com.nisovin.shopkeepers.shopobjects.citizens.CitizensShops$DelayedSetupTask", Strategy.GLOBAL),
++            // ShopkeeperSpawnQueue$SpawnerTask - the spawn queue's drain timer, started from
++            // ShopkeeperSpawner.onEnable() (TaskQueue.java:191 -> :99 -> ShopkeeperSpawner:95 ->
++            // SKShopkeeperRegistry:157 -> SKShopkeepersPlugin:427, runTaskTimer delay=1 period=3),
++            // the third abort in the chain. T-12 4.1 lists it as a global heartbeat; T-12 8-D's
++            // open question was whether its throttling still holds if the queue were fanned out
++            // per region - this rule does NOT fan it out, the whole drain loop keeps running on
++            // one thread, so the "workUnitsPerExecution per tick" budget is unchanged.
++            // TaskQueue.execute() polls a work unit and calls process(), which sets the
++            // shopkeeper's spawn state to DESPAWNED *before* attempting the spawn
++            // (ShopkeeperSpawnQueue.java:93-97) - so an ownership rejection inside the spawn
++            // leaves the in-memory state consistent with reality (not spawned) rather than
++            // half-written, and nothing here is persisted.
++            new Rule("com.nisovin.shopkeepers.shopkeeper.spawning.ShopkeeperSpawnQueue$SpawnerTask", Strategy.GLOBAL),
++            // ShopkeeperSpawner$CheckUnspawnableShopkeepersTask - the fourth abort, immediately
++            // after the queue starts (ShopkeeperSpawner.java:99, runTaskLater delay=5, one-shot).
++            // T-12 4.1: "global, but a one-shot startup scan". Its body walks the shopkeeper
++            // registry and only reads each shop object's in-memory lastSpawnFailed flag
++            // (ShopkeeperSpawner.java:808-855); it deletes anything only when
++            // delete-unspawnable-shopkeepers is on, which is false by default and explicitly false
++            // in s01's config.yml:102. At 5 ticks after enable no spawn attempt has happened yet,
++            // so the flag is false everywhere and this scan is a pure no-op at this callsite.
++            new Rule("com.nisovin.shopkeepers.shopkeeper.spawning.ShopkeeperSpawner$CheckUnspawnableShopkeepersTask", Strategy.GLOBAL),
++            // ShopkeeperTicker$ShopkeeperTickTask - the fifth and (as of this entry) last abort in
++            // onEnable() (ShopkeeperTicker.java:229 -> :221 -> :111 -> SKShopkeeperRegistry:158 ->
++            // SKShopkeepersPlugin:427, a BukkitRunnable so rTask is the task itself, runTaskTimer
++            // delay=5 period=5). T-12 8-B called this "B, but real work" - that assessment is
++            // about making the per-shop tick correct across regions, which needs the batched
++            // dirty/save accounting rewritten. This rule does not attempt that: the loop stays
++            // whole on one thread, exactly as today. Notably its per-shop step already wraps
++            // shopkeeper.tick() in try/catch Throwable (ShopkeeperTicker.java:271-276), so an
++            // ownership rejection is logged per shop and the loop still resets currentlyTicking
++            // and drains pendingTickingChanges - no stuck flag, no half-applied registration.
++            new Rule("com.nisovin.shopkeepers.shopkeeper.ticking.ShopkeeperTicker$ShopkeeperTickTask", Strategy.GLOBAL)
 +        )
 +    );
 +
