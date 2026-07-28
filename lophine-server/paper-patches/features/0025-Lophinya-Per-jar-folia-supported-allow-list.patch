@@ -31,10 +31,10 @@ Kill switch: -Dlophinya.compat.foliaSupportedAllowlist=false
 
 diff --git a/src/main/java/fun/bm/lophinya/compat/LophinyaFoliaSupportedAllowlist.java b/src/main/java/fun/bm/lophinya/compat/LophinyaFoliaSupportedAllowlist.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..9295c1ab989707228caef4647a7c0c5fc1ce7789
+index 0000000000000000000000000000000000000000..05c166b0f7fd46873c74780a2e038106e0fb9dd6
 --- /dev/null
 +++ b/src/main/java/fun/bm/lophinya/compat/LophinyaFoliaSupportedAllowlist.java
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,120 @@
 +package fun.bm.lophinya.compat;
 +
 +import com.mojang.logging.LogUtils;
@@ -94,7 +94,17 @@ index 0000000000000000000000000000000000000000..9295c1ab989707228caef4647a7c0c5f
 +        // gate does not weaken ownership checking in any way - it only lets onEnable() and event
 +        // registration run, so the scheduler dispatch fixes in this patch series have something to
 +        // attach to.
-+        "45E9907C61222E559ED2E099FFEE0EDE706A21243A31D7DB549BAF678708FDF0", "GriefPrevention 16.18.7"
++        "45E9907C61222E559ED2E099FFEE0EDE706A21243A31D7DB549BAF678708FDF0", "GriefPrevention 16.18.7",
++        // DecentHolograms 2.10.1 (s01-installed version). No official Folia path (upstream issue
++        // #123 confirms it). Core-shim research (evidence/20260728-t10-decenthollograms-
++        // callsite-analysis.md) found no sync scheduler call inside onEnable() itself - unlike
++        // GriefPrevention, this gate alone should be sufficient for onEnable() to complete. Its
++        // sync scheduler calls (Hologram.java:683, ActionType.java:69/83/116) are all triggered
++        // later, during actual gameplay (showing a legacy hologram page, running a command/
++        // console/teleport action), each with a single known Player at the point of scheduling -
++        // see evidence/20260728-decenthollograms-core-shim-implementation-plan.md for the
++        // per-callsite dispatch design (not yet implemented as of this entry).
++        "E247B7362C277DAD0596CB48B5D1570B1002FBA014A5AFD8458D978963A253B4", "DecentHolograms 2.10.1"
 +    );
 +
 +    /** SHA-256 of a jar is stable for the run; hashing it on every plugin-load check is wasteful. */
