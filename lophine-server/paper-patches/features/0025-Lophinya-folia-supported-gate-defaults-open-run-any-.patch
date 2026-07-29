@@ -1,0 +1,223 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: TinyYana <yanasakuranight@gmail.com>
+Date: Wed, 29 Jul 2026 19:46:17 +0800
+Subject: [PATCH] Lophinya: folia-supported gate defaults open (run any Paper
+ plugin)
+
+Lophine/Folia refuses to load any jar that does not declare folia-supported.
+That is the plugin author's one-time self-report, not a runtime safety
+mechanism - region ownership checking is, and it is untouched here.
+
+Lophinya exists to run any Paper plugin on top of Lophine, so this gate now
+defaults to open: an undeclared jar loads, and if it genuinely cannot work
+under regionised threading it throws at the actual callsite, with patch 0024's
+diagnostics naming the plugin, jar and callsite.
+
+This is not disable_check_for_folia_supported. A tiny SHA-256 deny-list still
+refuses jars whose own canonical upstream documents data loss under Folia
+(FastAsyncWorldEdit, EssentialsX and its two bundled companions) - that failure
+is silent, so letting them run and throw would protect nothing. Adding a plugin
+to the server needs no change to this file; only proving one destroys data does.
+
+Kill switch: -Dlophinya.compat.foliaSupportedAllowlist=false restores the stock
+Folia gate.
+
+diff --git a/src/main/java/fun/bm/lophinya/compat/LophinyaFoliaSupportedGate.java b/src/main/java/fun/bm/lophinya/compat/LophinyaFoliaSupportedGate.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..9ef65000b66eb43bc40a2c87cd717795e9185a1d
+--- /dev/null
++++ b/src/main/java/fun/bm/lophinya/compat/LophinyaFoliaSupportedGate.java
+@@ -0,0 +1,145 @@
++package fun.bm.lophinya.compat;
++
++import com.mojang.logging.LogUtils;
++import org.slf4j.Logger;
++
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.security.MessageDigest;
++import java.util.HexFormat;
++import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++
++/**
++ * Lophinya: the {@code folia-supported} load gate, inverted.
++ *
++ * <p>Folia's plugin loader rejects any jar that doesn't declare {@code folia-supported: true} in
++ * its own manifest, before {@code onEnable()} ever runs. That declaration is the plugin's own
++ * one-time self-report, read once at load time - it is <b>not</b> a runtime safety mechanism.
++ * The real safety mechanism is region ownership checking ({@code TickThread.ensureTickThread}),
++ * which runs on every Bukkit world-state access regardless of what a plugin's {@code plugin.yml}
++ * says, and is completely untouched by this class.
++ *
++ * <p>Lophinya's whole reason to exist is to be a layer on top of Lophine that runs <b>any</b> Paper
++ * plugin. Gating that on each plugin author having happened to type one line into their own
++ * {@code plugin.yml} is not compatibility work - it just moves the decision to someone who never
++ * tested against this server. So the gate defaults to <b>open</b>: a jar that does not declare
++ * {@code folia-supported} still loads, and if it genuinely cannot work under regionised threading
++ * it fails the way any incompatibility should - by throwing, loudly, at the actual call, with
++ * {@link LophinyaSchedulerDiagnostics} naming the plugin, the jar and the callsite.
++ *
++ * <p><b>This is not the same thing as Luminol's {@code disable_check_for_folia_supported}</b>, and
++ * the difference is the deny-list below. That flag is an unconditional global bypass. This gate
++ * still refuses a jar whose <b>own canonical upstream documents data loss</b> under Folia - the one
++ * failure mode "it will just throw" does not protect against, because those plugins do not throw,
++ * they silently corrupt. Data safety is priority 1 in PROJECT_CHARTER section 4; "runs any Paper plugin"
++ * is priority 2. The deny-list is where those two meet, and it is deliberately tiny.
++ *
++ * <p>Adding a plugin to this server therefore needs <b>no change to this file</b>. Only the
++ * opposite - establishing that some exact artifact destroys data - does.
++ *
++ * <p>Kill switch: {@code -Dlophinya.compat.foliaSupportedAllowlist=false}. When disabled, every jar
++ * goes back through the stock Folia gate: undeclared jars are rejected at load, as on stock Folia.
++ */
++public final class LophinyaFoliaSupportedGate {
++
++    private static final Logger LOGGER = LogUtils.getLogger();
++
++    public static final boolean ENABLED =
++        !"false".equalsIgnoreCase(System.getProperty("lophinya.compat.foliaSupportedAllowlist", "true"));
++
++    /**
++     * SHA-256 (uppercase hex, no separators) of jars that must <b>not</b> be loaded under Folia even
++     * though the gate is otherwise open, mapped to the reason. The bar for an entry here is high and
++     * specific: the plugin's own canonical upstream states that running it on Folia loses or
++     * corrupts data. Not "untested", not "looks risky", not "no official Folia build" - those all
++     * load, and throw if they must.
++     *
++     * <p>One entry per (plugin, exact version) pair. A version bump changes the hash and drops out
++     * of this list automatically, which is the correct default: a new release may well have fixed
++     * it, and the burden is on evidence, not on inheritance.
++     */
++    private static final Map<String, String> DENY = Map.of(
++        // FastAsyncWorldEdit 2.15.3+1704422 (s01-installed version). Canonical upstream
++        // (IntellectualSites/FastAsyncWorldEdit) PR #2682 states, for Folia, "expect to lose
++        // (world) data". World data loss is silent and unrecoverable - it does not surface as an
++        // exception, so the "let it throw" model gives no protection here.
++        // See project-docs DECISIONS.md D-13 / PLUGIN_INVENTORY.md #8.
++        "D72941FBFFFA8F3E7BF29F5B94AC29BCB20DD042B2AB2E5DBFB06AC12AFA456A", "FastAsyncWorldEdit 2.15.3 (upstream: expect to lose world data on Folia)",
++        // EssentialsX 2.22.1-dev+12 and its two bundled companions (s01-installed versions).
++        // Official EssentialsX has a documented data-loss risk under Folia (project-docs
++        // RISK_REGISTER.md R-05; upstream Folia support PR #6586 still open/unmerged). Same
++        // reasoning as FAWE: the failure mode is lost userdata, not an exception.
++        "ED0C4432BB286CE06820BA5A162FFAC91E34E02EBA644CFCF66AEC4FDA86AF42", "EssentialsX 2.22.1-dev+12 (RISK_REGISTER R-05: userdata loss risk on Folia)",
++        "E41DE7858E2C8F051D69B732D6334BD2D7042DAEB083E772064503AF58A38C6D", "EssentialsXChat 2.22.1-dev+12 (bundled with EssentialsX, same upstream)",
++        "1DF09DA6014F891E0C9A3785C15052B28AB0436CBD3E8EB2D3EF61A99BB32CDA", "EssentialsXSpawn 2.22.1-dev+12 (bundled with EssentialsX, same upstream)"
++    );
++
++    /** SHA-256 of a jar is stable for the run; hashing it on every plugin-load check is wasteful. */
++    private static final Map<Path, String> SHA_CACHE = new ConcurrentHashMap<>();
++
++    /** Log the decision once per jar, not once per gate (there are two gates per plugin). */
++    private static final Set<String> LOGGED = ConcurrentHashMap.newKeySet();
++
++    private LophinyaFoliaSupportedGate() {
++    }
++
++    /**
++     * Called only for jars that did <b>not</b> declare {@code folia-supported: true}; jars that did
++     * never reach here.
++     *
++     * @param jarPath path to the plugin jar being loaded
++     * @return true to load it anyway, false to let the stock Folia gate reject it
++     */
++    public static boolean isAllowed(final Path jarPath) {
++        if (!ENABLED || jarPath == null) {
++            return false;
++        }
++        final String sha256;
++        try {
++            sha256 = SHA_CACHE.computeIfAbsent(jarPath, LophinyaFoliaSupportedGate::hash);
++        } catch (final Throwable t) {
++            // Cannot hash it => cannot check it against DENY => must not let it through. This is
++            // the one place the open gate closes on error, and it has to: the deny-list is the
++            // only thing standing between a known data-destroying jar and the world files.
++            LOGGER.warn("[Lophinya] could not hash {} to check it against the folia-supported "
++                + "deny-list; refusing to load it rather than skipping the check", jarPath, t);
++            return false;
++        }
++
++        final String denyReason = DENY.get(sha256);
++        if (denyReason != null) {
++            if (LOGGED.add(sha256)) {
++                LOGGER.error("[Lophinya] REFUSING to load {} - {}. Lophinya loads any Paper plugin "
++                    + "that merely lacks a folia-supported declaration, but not one whose own "
++                    + "upstream documents data loss under Folia: that failure is silent, so letting "
++                    + "it run and throw would protect nothing. Remove the jar or use the Paper "
++                    + "server for this feature.", jarPath.getFileName(), denyReason);
++            }
++            return false;
++        }
++
++        if (LOGGED.add(sha256)) {
++            // Deliberately says nothing about whether this jar declared folia-supported: one of the
++            // three call sites (SpigotPluginProvider, legacy enable-time path) consults this gate
++            // for every legacy plugin, declared or not, so claiming "does not declare" here would
++            // be false for jars that do.
++            LOGGER.info("[Lophinya] folia-supported gate open for {} - Lophinya runs any Paper "
++                + "plugin. Region ownership checks (TickThread.ensureTickThread) are unaffected and "
++                + "still apply to every world-state call it makes; if it cannot work here it throws "
++                + "at the callsite, with diagnostics.", jarPath.getFileName());
++        }
++        return true;
++    }
++
++    private static String hash(final Path jarPath) {
++        try {
++            final MessageDigest md = MessageDigest.getInstance("SHA-256");
++            return HexFormat.of().withUpperCase().formatHex(md.digest(Files.readAllBytes(jarPath)));
++        } catch (final Throwable t) {
++            // Rethrown so isAllowed() fails closed - returning a sentinel would silently miss DENY.
++            throw new RuntimeException("cannot hash " + jarPath, t);
++        }
++    }
++}
+diff --git a/src/main/java/io/papermc/paper/plugin/provider/type/paper/PaperPluginProviderFactory.java b/src/main/java/io/papermc/paper/plugin/provider/type/paper/PaperPluginProviderFactory.java
+index c20c04938b2f62b9e75831c5fdfabbd6ec51538a..b5632b317a29da80fefaae074629e8d97b3e03a6 100644
+--- a/src/main/java/io/papermc/paper/plugin/provider/type/paper/PaperPluginProviderFactory.java
++++ b/src/main/java/io/papermc/paper/plugin/provider/type/paper/PaperPluginProviderFactory.java
+@@ -25,7 +25,8 @@ class PaperPluginProviderFactory implements PluginTypeFactory<PaperPluginParent,
+     @Override
+     public PaperPluginParent build(JarFile file, PaperPluginMeta configuration, Path source) {
+         // Folia start - block plugins not marked as supported
+-        if (!configuration.isFoliaSupported() && !me.earthme.luminol.config.modules.unsupported.DisableCheckForFoliaSupported.disableForPaper) { // Luminol - disable check for folia supported
++        if (!configuration.isFoliaSupported() && !me.earthme.luminol.config.modules.unsupported.DisableCheckForFoliaSupported.disableForPaper
++            && !fun.bm.lophinya.compat.LophinyaFoliaSupportedGate.isAllowed(source)) { // Lophinya - folia-supported gate defaults open
+             throw new RuntimeException("Could not load plugin '" + configuration.getDisplayName() + "' as it is not marked as supporting Folia!");
+         }
+         // Folia end - block plugins not marked as supported
+diff --git a/src/main/java/io/papermc/paper/plugin/provider/type/spigot/SpigotPluginProvider.java b/src/main/java/io/papermc/paper/plugin/provider/type/spigot/SpigotPluginProvider.java
+index 0fd1040ed376f19c6d5326767baaf3048ce1bfb4..b5560729fe6d494f5420610497b5ee548b205ea0 100644
+--- a/src/main/java/io/papermc/paper/plugin/provider/type/spigot/SpigotPluginProvider.java
++++ b/src/main/java/io/papermc/paper/plugin/provider/type/spigot/SpigotPluginProvider.java
+@@ -118,7 +118,14 @@ public class SpigotPluginProvider implements PluginProvider<JavaPlugin>, Provide
+             }
+             // Paper end
+ 
+-            server.getUnsafe().checkSupported(this.description);
++            // Lophinya start - folia-supported gate defaults open: this is a second, independent
++            // folia-supported gate that only legacy (Spigot-format) plugins hit, at enable time
++            // rather than discovery time. checkSupported(PluginDescriptionFile) has no jar-path
++            // context, so the allow-list check happens here at the call site instead of inside it.
++            if (!fun.bm.lophinya.compat.LophinyaFoliaSupportedGate.isAllowed(this.path)) {
++                server.getUnsafe().checkSupported(this.description);
++            }
++            // Lophinya end - folia-supported gate defaults open
+ 
+             final PluginClassLoader loader;
+             try {
+diff --git a/src/main/java/io/papermc/paper/plugin/provider/type/spigot/SpigotPluginProviderFactory.java b/src/main/java/io/papermc/paper/plugin/provider/type/spigot/SpigotPluginProviderFactory.java
+index 8f0b7b2985d3aadaacd5313d52d48ac916d871c9..51117c5813ede0f48c69e76238b9cc0cbab90f15 100644
+--- a/src/main/java/io/papermc/paper/plugin/provider/type/spigot/SpigotPluginProviderFactory.java
++++ b/src/main/java/io/papermc/paper/plugin/provider/type/spigot/SpigotPluginProviderFactory.java
+@@ -27,7 +27,8 @@ class SpigotPluginProviderFactory implements PluginTypeFactory<SpigotPluginProvi
+     @Override
+     public SpigotPluginProvider build(JarFile file, PluginDescriptionFile configuration, Path source) throws InvalidDescriptionException {
+         // Folia start - block plugins not marked as supported
+-        if (!configuration.isFoliaSupported() && !me.earthme.luminol.config.modules.unsupported.DisableCheckForFoliaSupported.disableForPaper) { // Luminol - disable check for folia supported
++        if (!configuration.isFoliaSupported() && !me.earthme.luminol.config.modules.unsupported.DisableCheckForFoliaSupported.disableForPaper
++            && !fun.bm.lophinya.compat.LophinyaFoliaSupportedGate.isAllowed(source)) { // Lophinya - folia-supported gate defaults open
+             throw new RuntimeException("Could not load plugin '" + configuration.getDisplayName() + "' as it is not marked as supporting Folia!");
+         }
+         // Folia end - block plugins not marked as supported
