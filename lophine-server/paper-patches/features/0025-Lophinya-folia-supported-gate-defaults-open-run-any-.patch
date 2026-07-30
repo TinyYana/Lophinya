@@ -24,10 +24,10 @@ Folia gate.
 
 diff --git a/src/main/java/fun/bm/lophinya/compat/LophinyaFoliaSupportedGate.java b/src/main/java/fun/bm/lophinya/compat/LophinyaFoliaSupportedGate.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..9ef65000b66eb43bc40a2c87cd717795e9185a1d
+index 0000000000000000000000000000000000000000..03cfc9309018e580a80766899e96e9d502893e7c
 --- /dev/null
 +++ b/src/main/java/fun/bm/lophinya/compat/LophinyaFoliaSupportedGate.java
-@@ -0,0 +1,145 @@
+@@ -0,0 +1,166 @@
 +package fun.bm.lophinya.compat;
 +
 +import com.mojang.logging.LogUtils;
@@ -36,7 +36,9 @@ index 0000000000000000000000000000000000000000..9ef65000b66eb43bc40a2c87cd717795
 +import java.nio.file.Files;
 +import java.nio.file.Path;
 +import java.security.MessageDigest;
++import java.util.HashSet;
 +import java.util.HexFormat;
++import java.util.Locale;
 +import java.util.Map;
 +import java.util.Set;
 +import java.util.concurrent.ConcurrentHashMap;
@@ -59,15 +61,28 @@ index 0000000000000000000000000000000000000000..9ef65000b66eb43bc40a2c87cd717795
 + * it fails the way any incompatibility should - by throwing, loudly, at the actual call, with
 + * {@link LophinyaSchedulerDiagnostics} naming the plugin, the jar and the callsite.
 + *
-+ * <p><b>This is not the same thing as Luminol's {@code disable_check_for_folia_supported}</b>, and
-+ * the difference is the deny-list below. That flag is an unconditional global bypass. This gate
-+ * still refuses a jar whose <b>own canonical upstream documents data loss</b> under Folia - the one
-+ * failure mode "it will just throw" does not protect against, because those plugins do not throw,
-+ * they silently corrupt. Data safety is priority 1 in PROJECT_CHARTER section 4; "runs any Paper plugin"
-+ * is priority 2. The deny-list is where those two meet, and it is deliberately tiny.
++ * <h2>This class contains no list of plugins, and must never grow one</h2>
++ * An earlier version of it did: a hardcoded map of jar hashes to refuse. That was a design error,
++ * and the reason is not stylistic. A per-plugin list compiled into the server means every plugin
++ * update, every version bump, and every new plugin is a decision that has to be made <i>by whoever
++ * builds the core</i> - so "runs any Paper plugin" silently becomes "runs any Paper plugin somebody
++ * remembered to vet", and an operator cannot deploy a plugin the core has never heard of without
++ * waiting for a core release. That is the opposite of the product, and it is not something a fork
++ * has any business deciding on an operator's behalf.
 + *
-+ * <p>Adding a plugin to this server therefore needs <b>no change to this file</b>. Only the
-+ * opposite - establishing that some exact artifact destroys data - does.
++ * <p>So the refusal list lives entirely in the operator's start script, is empty by default, and the
++ * core ships knowing nothing about any particular plugin:
++ *
++ * <pre>
++ *   -Dlophinya.compat.refuseJars=&lt;sha256&gt;[,&lt;sha256&gt;...]
++ * </pre>
++ *
++ * <p>It exists because one failure mode the "let it throw" model genuinely does not cover is the
++ * plugin that does not throw - the one whose own upstream documents that it silently destroys data
++ * under regionised threading. An operator who knows that about a specific artifact needs a way to
++ * say so, and pinning it by exact hash means a new release is admitted automatically rather than
++ * inheriting a verdict earned by an older build. But that is the operator's knowledge to apply, not
++ * the core's to hardcode.
 + *
 + * <p>Kill switch: {@code -Dlophinya.compat.foliaSupportedAllowlist=false}. When disabled, every jar
 + * goes back through the stock Folia gate: undeclared jars are rejected at load, as on stock Folia.
@@ -80,31 +95,11 @@ index 0000000000000000000000000000000000000000..9ef65000b66eb43bc40a2c87cd717795
 +        !"false".equalsIgnoreCase(System.getProperty("lophinya.compat.foliaSupportedAllowlist", "true"));
 +
 +    /**
-+     * SHA-256 (uppercase hex, no separators) of jars that must <b>not</b> be loaded under Folia even
-+     * though the gate is otherwise open, mapped to the reason. The bar for an entry here is high and
-+     * specific: the plugin's own canonical upstream states that running it on Folia loses or
-+     * corrupts data. Not "untested", not "looks risky", not "no official Folia build" - those all
-+     * load, and throw if they must.
-+     *
-+     * <p>One entry per (plugin, exact version) pair. A version bump changes the hash and drops out
-+     * of this list automatically, which is the correct default: a new release may well have fixed
-+     * it, and the burden is on evidence, not on inheritance.
++     * SHA-256 (uppercase hex, no separators) of jars this operator has chosen to refuse, from
++     * {@code -Dlophinya.compat.refuseJars}. <b>Empty by default</b>, which is what makes the gate
++     * genuinely open - see the class docs for why this is a property and not a list in the source.
 +     */
-+    private static final Map<String, String> DENY = Map.of(
-+        // FastAsyncWorldEdit 2.15.3+1704422 (s01-installed version). Canonical upstream
-+        // (IntellectualSites/FastAsyncWorldEdit) PR #2682 states, for Folia, "expect to lose
-+        // (world) data". World data loss is silent and unrecoverable - it does not surface as an
-+        // exception, so the "let it throw" model gives no protection here.
-+        // See project-docs DECISIONS.md D-13 / PLUGIN_INVENTORY.md #8.
-+        "D72941FBFFFA8F3E7BF29F5B94AC29BCB20DD042B2AB2E5DBFB06AC12AFA456A", "FastAsyncWorldEdit 2.15.3 (upstream: expect to lose world data on Folia)",
-+        // EssentialsX 2.22.1-dev+12 and its two bundled companions (s01-installed versions).
-+        // Official EssentialsX has a documented data-loss risk under Folia (project-docs
-+        // RISK_REGISTER.md R-05; upstream Folia support PR #6586 still open/unmerged). Same
-+        // reasoning as FAWE: the failure mode is lost userdata, not an exception.
-+        "ED0C4432BB286CE06820BA5A162FFAC91E34E02EBA644CFCF66AEC4FDA86AF42", "EssentialsX 2.22.1-dev+12 (RISK_REGISTER R-05: userdata loss risk on Folia)",
-+        "E41DE7858E2C8F051D69B732D6334BD2D7042DAEB083E772064503AF58A38C6D", "EssentialsXChat 2.22.1-dev+12 (bundled with EssentialsX, same upstream)",
-+        "1DF09DA6014F891E0C9A3785C15052B28AB0436CBD3E8EB2D3EF61A99BB32CDA", "EssentialsXSpawn 2.22.1-dev+12 (bundled with EssentialsX, same upstream)"
-+    );
++    private static final Set<String> REFUSED = parseRefused();
 +
 +    /** SHA-256 of a jar is stable for the run; hashing it on every plugin-load check is wasteful. */
 +    private static final Map<Path, String> SHA_CACHE = new ConcurrentHashMap<>();
@@ -126,41 +121,66 @@ index 0000000000000000000000000000000000000000..9ef65000b66eb43bc40a2c87cd717795
 +        if (!ENABLED || jarPath == null) {
 +            return false;
 +        }
++        if (REFUSED.isEmpty()) {
++            // Nothing to check against, so skip hashing the jar entirely - this is the default path.
++            logOpen(jarPath, jarPath.getFileName().toString());
++            return true;
++        }
++
 +        final String sha256;
 +        try {
 +            sha256 = SHA_CACHE.computeIfAbsent(jarPath, LophinyaFoliaSupportedGate::hash);
 +        } catch (final Throwable t) {
-+            // Cannot hash it => cannot check it against DENY => must not let it through. This is
-+            // the one place the open gate closes on error, and it has to: the deny-list is the
-+            // only thing standing between a known data-destroying jar and the world files.
-+            LOGGER.warn("[Lophinya] could not hash {} to check it against the folia-supported "
-+                + "deny-list; refusing to load it rather than skipping the check", jarPath, t);
++            // Cannot hash it => cannot check it against the operator's refusal list => must not let
++            // it through. This is the one place the open gate closes on error, and it has to: the
++            // operator asked for specific jars to be kept away from their data, and "we could not
++            // tell which jar this is" is not a good enough reason to ignore that.
++            LOGGER.warn("[Lophinya] could not hash {} to check it against "
++                + "-Dlophinya.compat.refuseJars; refusing to load it rather than skipping the check",
++                jarPath, t);
 +            return false;
 +        }
 +
-+        final String denyReason = DENY.get(sha256);
-+        if (denyReason != null) {
++        if (REFUSED.contains(sha256)) {
 +            if (LOGGED.add(sha256)) {
-+                LOGGER.error("[Lophinya] REFUSING to load {} - {}. Lophinya loads any Paper plugin "
-+                    + "that merely lacks a folia-supported declaration, but not one whose own "
-+                    + "upstream documents data loss under Folia: that failure is silent, so letting "
-+                    + "it run and throw would protect nothing. Remove the jar or use the Paper "
-+                    + "server for this feature.", jarPath.getFileName(), denyReason);
++                LOGGER.error("[Lophinya] REFUSING to load {} - its SHA-256 is listed in "
++                    + "-Dlophinya.compat.refuseJars. Lophinya itself has no opinion about any "
++                    + "plugin; this refusal is entirely this server's configuration. Remove the hash "
++                    + "from that property to load it.", jarPath.getFileName());
 +            }
 +            return false;
 +        }
 +
-+        if (LOGGED.add(sha256)) {
++        logOpen(jarPath, sha256);
++        return true;
++    }
++
++    private static void logOpen(final Path jarPath, final String logKey) {
++        if (LOGGED.add(logKey)) {
 +            // Deliberately says nothing about whether this jar declared folia-supported: one of the
-+            // three call sites (SpigotPluginProvider, legacy enable-time path) consults this gate
-+            // for every legacy plugin, declared or not, so claiming "does not declare" here would
-+            // be false for jars that do.
++            // call sites (SpigotPluginProvider, legacy enable-time path) consults this gate for every
++            // legacy plugin, declared or not, so claiming "does not declare" here would be false for
++            // jars that do.
 +            LOGGER.info("[Lophinya] folia-supported gate open for {} - Lophinya runs any Paper "
 +                + "plugin. Region ownership checks (TickThread.ensureTickThread) are unaffected and "
 +                + "still apply to every world-state call it makes; if it cannot work here it throws "
 +                + "at the callsite, with diagnostics.", jarPath.getFileName());
 +        }
-+        return true;
++    }
++
++    private static Set<String> parseRefused() {
++        final String raw = System.getProperty("lophinya.compat.refuseJars", "");
++        if (raw.isBlank()) {
++            return Set.of();
++        }
++        final Set<String> hashes = new HashSet<>();
++        for (final String part : raw.split(",")) {
++            final String trimmed = part.trim().toUpperCase(Locale.ROOT);
++            if (!trimmed.isEmpty()) {
++                hashes.add(trimmed);
++            }
++        }
++        return Set.copyOf(hashes);
 +    }
 +
 +    private static String hash(final Path jarPath) {
@@ -168,7 +188,8 @@ index 0000000000000000000000000000000000000000..9ef65000b66eb43bc40a2c87cd717795
 +            final MessageDigest md = MessageDigest.getInstance("SHA-256");
 +            return HexFormat.of().withUpperCase().formatHex(md.digest(Files.readAllBytes(jarPath)));
 +        } catch (final Throwable t) {
-+            // Rethrown so isAllowed() fails closed - returning a sentinel would silently miss DENY.
++            // Rethrown so isAllowed() fails closed - returning a sentinel would silently miss a
++            // hash the operator asked us to refuse.
 +            throw new RuntimeException("cannot hash " + jarPath, t);
 +        }
 +    }

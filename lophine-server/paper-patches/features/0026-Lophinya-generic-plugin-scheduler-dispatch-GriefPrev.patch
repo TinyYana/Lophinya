@@ -53,10 +53,10 @@ Kill switch: -Dlophinya.compat.pluginSchedulerDispatch=true (default off).
 
 diff --git a/src/main/java/fun/bm/lophinya/compat/LophinyaPluginSchedulerDispatch.java b/src/main/java/fun/bm/lophinya/compat/LophinyaPluginSchedulerDispatch.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..4bba3caaf3bbac238042f69f3db9ca57723dd609
+index 0000000000000000000000000000000000000000..980d27b2e522672fee2f9a7222582ca4ee9a804f
 --- /dev/null
 +++ b/src/main/java/fun/bm/lophinya/compat/LophinyaPluginSchedulerDispatch.java
-@@ -0,0 +1,334 @@
+@@ -0,0 +1,543 @@
 +package fun.bm.lophinya.compat;
 +
 +import com.mojang.logging.LogUtils;
@@ -83,7 +83,9 @@ index 0000000000000000000000000000000000000000..4bba3caaf3bbac238042f69f3db9ca57
 + *
 + * <h2>What this is, precisely</h2>
 + * A registry of {@link Rule}s, keyed by the exact SHA-256 of one plugin jar. Each rule says
-+ * "when THIS exact task class is about to be rejected, dispatch it THIS way instead" - either to
++ * "when THIS task class is about to be rejected, dispatch it THIS way instead" - where the class is
++ * either named, or (for the lambdas and method references modern plugins schedule) identified by the
++ * one class that declared it, see {@link #matches(Rule, String)} - either to
 + * {@link io.papermc.paper.threadedregions.scheduler.GlobalRegionScheduler} (for tasks with no
 + * single player/location context) or to a specific player's own
 + * {@link io.papermc.paper.threadedregions.scheduler.EntityScheduler} (read via reflection on a
@@ -141,14 +143,32 @@ index 0000000000000000000000000000000000000000..4bba3caaf3bbac238042f69f3db9ca57
 +         */
 +        GLOBAL_OR_PLAYER_FIELD,
 +        /** Always a single known player (the field is never null for this class) - dispatched to that player's own scheduler. */
-+        PLAYER_FIELD
++        PLAYER_FIELD,
++        /**
++         * A lambda that captures exactly one player, reached by scanning the synthesised capture
++         * fields rather than by name. Lambda captures are named positionally ({@code arg$1},
++         * {@code arg$2}, ...), so {@link #PLAYER_FIELD}'s name lookup cannot address them - that is
++         * the gap this covers. See {@link #findCapturedPlayer}.
++         */
++        PLAYER_IN_CAPTURE
 +    }
 +
 +    /**
-+     * @param className    fully-qualified name of the task class this rule matches
++     * Suffix that turns a {@link Rule#className()} into a lambda rule - see
++     * {@link #matches(Rule, String)}.
++     */
++    private static final String LAMBDA_SUFFIX = "$$Lambda";
++
++    /**
++     * @param className    fully-qualified name of the task class this rule matches. A name ending in
++     *                     {@code $$Lambda} matches every JVM-generated lambda or method-reference
++     *                     class declared by that one class instead - see {@link #matches(Rule, String)}
 +     * @param strategy     how to dispatch a match
-+     * @param playerField  name of the reflected {@link Player} field (required for
-+     *                     {@link Strategy#GLOBAL_OR_PLAYER_FIELD} and {@link Strategy#PLAYER_FIELD}, unused for {@link Strategy#GLOBAL})
++     * @param playerField  for {@link Strategy#GLOBAL_OR_PLAYER_FIELD} and {@link Strategy#PLAYER_FIELD},
++     *                     the name of the reflected {@link Player} field. For
++     *                     {@link Strategy#PLAYER_IN_CAPTURE}, the name of a zero-argument accessor to
++     *                     call on a captured object to reach its {@link Player} ({@code null} when the
++     *                     captured value is itself a {@link Player}). Unused for {@link Strategy#GLOBAL}
 +     */
 +    public record Rule(String className, Strategy strategy, String playerField) {
 +        public Rule(final String className, final Strategy strategy) {
@@ -244,6 +264,87 @@ index 0000000000000000000000000000000000000000..4bba3caaf3bbac238042f69f3db9ca57
 +            // ownership rejection is logged per shop and the loop still resets currentlyTicking
 +            // and drains pendingTickingChanges - no stuck flag, no half-applied registration.
 +            new Rule("com.nisovin.shopkeepers.shopkeeper.ticking.ShopkeeperTicker$ShopkeeperTickTask", Strategy.GLOBAL)
++        ),
++        // EssentialsX 2.22.1-dev+12-776f709 (the exact artifact installed on s01). Research:
++        // evidence/20260729d-t01-essentialsx-callsite-analysis.md (the full callsite inventory),
++        // evidence/20260730b-essentialsx-economy-serialization.md section 5.6 (the runtime blocker
++        // order, found by cold-starting once per rule), evidence/20260730c-essentialsx-delivery.md
++        // (the per-rule source reading below, and the L2/L3 runs).
++        //
++        // These four are the whole set of Bukkit *sync* scheduler calls this jar makes on a path
++        // that s01's own configuration actually reaches during enable and first join. Three are
++        // lambdas, which is why this table needed the $$Lambda prefix form at all - see matches().
++        // Every one of them is a server-scope startup or housekeeping task with no single player or
++        // location context at schedule time, so GLOBAL is not a fallback here, it is the correct
++        // target; nothing below is a per-region task being relocated.
++        "ED0C4432BB286CE06820BA5A162FFAC91E34E02EBA644CFCF66AEC4FDA86AF42", List.of(
++            // EconomyLayers.onEnable (EconomyLayers.java:35) <- Essentials.onEnable(:330). The
++            // earliest hard block in the enable chain - earlier than T-01 predicted. EconomyLayers
++            // declares exactly one lambda in the entire file, so the prefix is unambiguous for this
++            // jar. Body: sets a static boolean, walks getPluginManager().getPlugins(), and calls
++            // VaultLayer.enable/onServerLoad, whose only non-trivial statement is
++            // Bukkit.getServicesManager().load(Economy.class) (VaultLayer.java:57). No world, block,
++            // chunk or entity access anywhere in it - the global region is exactly where a
++            // server-wide service lookup belongs.
++            new Rule("com.earth2me.essentials.economy.EconomyLayers$$Lambda", Strategy.GLOBAL),
++            // Settings.reloadConfig(:850, :876, :891) <- Essentials.reload(:602) <- onEnable(:429).
++            // Three scheduler-bound lambdas (the third is a syncCommandsProvider::syncCommands
++            // method reference, which the JVM also names <declaringClass>$$Lambda). This is the
++            // case where a prefix rule covers more than one call site, so the claim has to hold for
++            // all three: all three are inside "if (reloadCount.get() < 2)", i.e. the two startup
++            // reloads only - at runtime (/ess reload) the else-branches run inline and never reach
++            // the scheduler at all. All three do command-map work: re-registering plugin command
++            // aliases and rebuilding the command tree. None touches world state. Settings.java's
++            // other lambdas (:705, :738, :2116) are computeIfAbsent/forEach callbacks that never go
++            // near a scheduler, so they cannot be caught by this rule.
++            new Rule("com.earth2me.essentials.Settings$$Lambda", Strategy.GLOBAL),
++            // EssentialsTimer (Essentials.java:439, delay 1000 period 50) - a named class, the
++            // third block in the enable chain. This is the one entry whose *behaviour* under GLOBAL
++            // is a documented degradation rather than an equivalence, and the degradation is
++            // per-player state, so it is spelled out rather than waved at:
++            //   - setLastOnlineActivity / checkMuteTimeout / resetInvulnerabilityAfterTeleport all
++            //     read and write plain UserData fields and send chat, no world access;
++            //   - checkJailTimeout (User.java:771) already uses getAsyncTeleport(), the Folia-safe
++            //     path, and is only reachable for a jailed player (s01 has no jail.yml);
++            //   - checkActivity -> setAfk(true) (User.java:690-692) is the real one: it calls
++            //     CraftPlayer.setSleepingIgnored, which Folia itself reroutes to the global tick
++            //     thread (ServerLevel.updateSleepingPlayerList), and reads getLocation() for the
++            //     AFK anchor position. That read has no ownership check in Folia, so it does not
++            //     throw - it returns a possibly one-tick-stale position, which only shifts when
++            //     cancel-afk-on-move fires. s01 runs auto-afk: 300 so this path IS reachable
++            //     (auto-afk-timeout: -1 only disables the kick branch, not the AFK branch).
++            // Recorded as a bounded, measured C-UX gap, not as "no world access".
++            new Rule("com.earth2me.essentials.EssentialsTimer", Strategy.GLOBAL),
++            // Backup (Backup.java:51, repeating at backup.interval) - a named class. Not reached at
++            // cold start: the constructor only starts the timer when players are online or
++            // always-run is set (Backup.java:28, s01 has always-run: false), so it first schedules
++            // from onPlayerJoin -> startTask, inside the join event handler and with no try/catch.
++            // Left unhandled it aborts PlayerJoinEvent for Essentials halfway. Its run() returns at
++            // Backup.java:70 unless a backup command is configured, and s01's config.yml leaves
++            // that key commented out - so under this exact tuple the task body is a no-op. If a
++            // command were configured it would dispatchCommand("save-all") and fork a process, both
++            // of which belong on the global region anyway.
++            new Rule("com.earth2me.essentials.Backup", Strategy.GLOBAL),
++            // User.updateActivityOnChat (User.java:864) - the only one of these four that is not a
++            // startup task, and the only one that is per-player rather than server-scope. It fires
++            // on EVERY chat message, because s01 sets cancel-afk-on-chat: true, from inside
++            // AsyncPlayerChatEvent (EssentialsPlayerListener.java:230). Unhandled it throws there,
++            // which aborts Essentials' chat handler: measured effect is that chat is silently never
++            // formatted or delivered at all, with only a stack trace in the console.
++            //
++            // The comment on the plugin's own callsite says why it schedules at all: "Chat happens
++            // async, make sure we have a sync context". On Folia the correct context is the chatting
++            // player's own region, which is what PLAYER_IN_CAPTURE resolves - the lambda captures the
++            // User, and User.getBase() is the Player (User -> UserData -> PlayerExtension.base).
++            // GLOBAL would be wrong here, not merely suboptimal: the task body writes that one
++            // player's AFK state and display name.
++            //
++            // Task body read line by line (User.updateActivity -> setAfk(false, CHAT)): the only
++            // world-adjacent call is CraftPlayer.setSleepingIgnored, which Folia itself reroutes to
++            // the global tick thread (ServerLevel.updateSleepingPlayerList), and the false branch of
++            // setAfk never reads getLocation() - only setAfk(true) does. updateAfkListName() is a
++            // no-op under s01's afk-list-name: "none".
++            new Rule("com.earth2me.essentials.User$$Lambda", Strategy.PLAYER_IN_CAPTURE, "getBase")
 +        )
 +    );
 +
@@ -280,7 +381,7 @@ index 0000000000000000000000000000000000000000..4bba3caaf3bbac238042f69f3db9ca57
 +            final String className = task.rTask.getClass().getName();
 +            Rule matched = null;
 +            for (final Rule r : rules) {
-+                if (r.className().equals(className)) {
++                if (matches(r, className)) {
 +                    matched = r;
 +                    break;
 +                }
@@ -297,6 +398,21 @@ index 0000000000000000000000000000000000000000..4bba3caaf3bbac238042f69f3db9ca57
 +                scheduled = repeating
 +                    ? Bukkit.getGlobalRegionScheduler().runAtFixedRate(plugin, ignored -> task.run(), safeDelay, period)
 +                    : Bukkit.getGlobalRegionScheduler().runDelayed(plugin, ignored -> task.run(), safeDelay);
++            } else if (matched.strategy() == Strategy.PLAYER_IN_CAPTURE) {
++                final Player captured = findCapturedPlayer(task.rTask, matched.playerField());
++                if (captured == null) {
++                    // Ambiguous, absent, or unreadable - fall through to stock rejection. Same
++                    // fail-closed contract as the named-field strategies.
++                    return null;
++                }
++                final ScheduledTask s = repeating
++                    ? captured.getScheduler().runAtFixedRate(plugin, ignored -> task.run(), null, safeDelay, period)
++                    : captured.getScheduler().runDelayed(plugin, ignored -> task.run(), null, safeDelay);
++                if (s == null) {
++                    // Player already gone by schedule time - nothing to do, and not an error.
++                    return task;
++                }
++                scheduled = s;
 +            } else {
 +                // GLOBAL_OR_PLAYER_FIELD or PLAYER_FIELD - both need the reflected field first.
 +                // Fail closed on any reflection trouble: an unreadable field is "unknown", not
@@ -338,6 +454,44 @@ index 0000000000000000000000000000000000000000..4bba3caaf3bbac238042f69f3db9ca57
 +            LOGGER.warn("[Lophinya] plugin scheduler dispatch failed (falling through to stock rejection)", t);
 +            return null;
 +        }
++    }
++
++    /**
++     * Does this rule match the runtime class name of a task?
++     *
++     * <p>Named task classes are matched exactly, as before. Lambdas and method references have no
++     * source-level name to match: the JVM synthesises one per call site, as
++     * {@code <declaringClass>$$Lambda/0x<address>} (JDK 15 and later) or
++     * {@code <declaringClass>$$Lambda$<n>} (older). The address part is a different value on every
++     * run, so an exact rule can never match one - which is why the rule table could only ever
++     * express plugins written in the older named-{@code Runnable} style.
++     *
++     * <p>What makes the prefix usable as a rule key rather than a wildcard is that
++     * <b>the part before {@code $$Lambda} is the fully-qualified name of the one class that declared
++     * the lambda</b>, and that part does not vary. So a rule of {@code com.example.Foo$$Lambda} is
++     * scoped to exactly the lambdas written inside {@code Foo} - no wider. It is less precise than a
++     * named class only in one specific way: a class declaring several <i>scheduler-bound</i> lambdas
++     * cannot distinguish between them, so a rule of this shape asserts that every scheduler-bound
++     * lambda in that class is safe under the same strategy. That is a claim about the real source of
++     * one exact jar, and the evidence next to each entry in {@link #RULES} has to make it explicitly
++     * - it is not weaker research, it is research over a slightly larger unit.
++     *
++     * <p>The character check after the prefix is what stops this being a plain {@code startsWith}:
++     * {@code $$} is legal in a Java identifier, so a source-level class literally called
++     * {@code FooBar} would otherwise be matched by a rule for {@code Foo}, and a hand-written class
++     * called {@code Foo$$LambdaHelper} by a rule for {@code Foo$$Lambda}. Only the JVM's own two
++     * separators are accepted.
++     */
++    private static boolean matches(final Rule rule, final String className) {
++        final String want = rule.className();
++        if (!want.endsWith(LAMBDA_SUFFIX)) {
++            return want.equals(className);
++        }
++        if (!className.startsWith(want) || className.length() == want.length()) {
++            return false;
++        }
++        final char separator = className.charAt(want.length());
++        return separator == '/' || separator == '$';
 +    }
 +
 +    /** Called from the plugin-disable path so a disabled plugin's redispatched tasks stop running. */
@@ -389,6 +543,61 @@ index 0000000000000000000000000000000000000000..4bba3caaf3bbac238042f69f3db9ca57
 +    }
 +
 +    private record PlayerFieldResult(boolean readable, Player player) {
++    }
++
++    /**
++     * Finds the single {@link Player} a lambda captured, by scanning its synthesised capture fields.
++     *
++     * <p>{@code T-14} established why a name lookup cannot work here: the compiler names lambda
++     * captures {@code arg$1}, {@code arg$2}, ... in declaration order, so the name carries no meaning
++     * and shifts whenever the lambda's surrounding code is edited. Scanning by <i>type</i> is stable
++     * across recompiles in a way scanning by name is not.
++     *
++     * <p>{@code accessor}, when given, is a zero-argument method to call on a captured value to reach
++     * its player - for the common case of a plugin's own user-wrapper type holding the
++     * {@link Player} rather than being one. It is named per rule, from reading that plugin's source,
++     * so this method stays free of any plugin-specific knowledge.
++     *
++     * <p><b>Ambiguity is failure.</b> If the scan finds two different players (by UUID), it returns
++     * {@code null} rather than picking one: two players means the task is not the single-player task
++     * the rule claims it is, and guessing which region owns it is exactly {@code DEC-19} B1. Zero
++     * matches and reflection errors are likewise {@code null}.
++     */
++    private static Player findCapturedPlayer(final Runnable rTask, final String accessor) {
++        Player found = null;
++        try {
++            for (final Field f : rTask.getClass().getDeclaredFields()) {
++                f.setAccessible(true);
++                final Object value = f.get(rTask);
++                if (value == null) {
++                    continue;
++                }
++                Player candidate = null;
++                if (value instanceof Player p) {
++                    candidate = p;
++                } else if (accessor != null) {
++                    try {
++                        final var m = value.getClass().getMethod(accessor);
++                        m.setAccessible(true);
++                        if (m.invoke(value) instanceof Player p) {
++                            candidate = p;
++                        }
++                    } catch (final Throwable ignored) {
++                        // This capture simply isn't the wrapper type; keep scanning.
++                    }
++                }
++                if (candidate == null) {
++                    continue;
++                }
++                if (found != null && !found.getUniqueId().equals(candidate.getUniqueId())) {
++                    return null;
++                }
++                found = candidate;
++            }
++        } catch (final Throwable t) {
++            return null;
++        }
++        return found;
 +    }
 +}
 diff --git a/src/main/java/io/papermc/paper/plugin/manager/PaperPluginInstanceManager.java b/src/main/java/io/papermc/paper/plugin/manager/PaperPluginInstanceManager.java

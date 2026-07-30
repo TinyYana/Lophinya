@@ -78,10 +78,10 @@ and 20260730b-essentialsx-economy-serialization.md.
 
 diff --git a/src/main/java/fun/bm/lophinya/compat/LophinyaEconomySerialization.java b/src/main/java/fun/bm/lophinya/compat/LophinyaEconomySerialization.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..05dd530b6e653fb7527f3c2e25fbc2bfe9b3dc25
+index 0000000000000000000000000000000000000000..d341f2e14d7ae5474ec020d45684712378c6b167
 --- /dev/null
 +++ b/src/main/java/fun/bm/lophinya/compat/LophinyaEconomySerialization.java
-@@ -0,0 +1,308 @@
+@@ -0,0 +1,331 @@
 +package fun.bm.lophinya.compat;
 +
 +import com.mojang.logging.LogUtils;
@@ -164,14 +164,24 @@ index 0000000000000000000000000000000000000000..05dd530b6e653fb7527f3c2e25fbc2bf
 + * new reach - it only narrows concurrency for a plugin that is already running. A failure here can
 + * only lose the added protection, never create a new code path.
 + *
-+ * <p>Kill switch: {@code -Dlophinya.compat.economySerialization=true} - defaults to <b>off</b>.
++ * <p>Kill switch: {@code -Dlophinya.compat.economySerialization=false} - defaults to <b>on</b>, see
++ * {@link #ENABLED} for why this one is not default-off.
 + */
 +public final class LophinyaEconomySerialization {
 +
 +    private static final Logger LOGGER = LogUtils.getLogger();
 +
++    /**
++     * Defaults to <b>on</b>, unlike {@link LophinyaPluginSchedulerDispatch}. The reason is that this
++     * guard and {@link LophinyaFoliaSupportedGate}'s deny-list are two halves of one decision: the
++     * only plugins this guard has rules for are exactly the plugins the deny-list refuses, so
++     * whenever a rule can apply at all, the guard being off means silent lost updates. Leaving it
++     * default-off would make removing a deny-list entry - a one-line change - quietly ship the
++     * failure the entry existed to prevent. While the deny-list stands the guard is inert and
++     * measurably so: no guarded plugin loads, so nothing is wrapped and nothing is locked.
++     */
 +    public static final boolean ENABLED =
-+        "true".equalsIgnoreCase(System.getProperty("lophinya.compat.economySerialization", "false"));
++        !"false".equalsIgnoreCase(System.getProperty("lophinya.compat.economySerialization", "true"));
 +
 +    /**
 +     * One entry per (plugin, exact jar SHA-256), same versioning discipline as
@@ -215,6 +225,8 @@ index 0000000000000000000000000000000000000000..05dd530b6e653fb7527f3c2e25fbc2bf
 +    private static final ReentrantReadWriteLock COARSE = new ReentrantReadWriteLock(true);
 +    private static final Map<String, ReentrantLock> ACCOUNT_LOCKS = new ConcurrentHashMap<>();
 +    private static final Map<Path, String> SHA_CACHE = new ConcurrentHashMap<>();
++    /** Log the first time each guarded command actually goes through layer B, not every time. */
++    private static final Set<String> COMMANDS_LOGGED = ConcurrentHashMap.newKeySet();
 +
 +    private LophinyaEconomySerialization() {
 +    }
@@ -346,7 +358,18 @@ index 0000000000000000000000000000000000000000..05dd530b6e653fb7527f3c2e25fbc2bf
 +        }
 +        try {
 +            final Guard guard = RULES.get(sha256(pc.getPlugin()));
-+            return guard != null && guard.commands().contains(command.getName().toLowerCase(Locale.ROOT));
++            final String name = command.getName().toLowerCase(Locale.ROOT);
++            if (guard == null || !guard.commands().contains(name)) {
++                return false;
++            }
++            // Layer B otherwise has no positive signal at all: the only evidence it ran was that
++            // the guarded commands did not misbehave, which is indistinguishable from the guard
++            // never having matched. One line per command name, once per server lifetime.
++            if (COMMANDS_LOGGED.add(name)) {
++                LOGGER.info("[Lophinya] {}: running /{} under the exclusive economy lock - first hit "
++                    + "this run; version-locked rule table entry", pc.getPlugin().getName(), name);
++            }
++            return true;
 +        } catch (final Throwable t) {
 +            return false;
 +        }
