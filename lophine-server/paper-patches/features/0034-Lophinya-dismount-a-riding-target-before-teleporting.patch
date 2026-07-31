@@ -27,10 +27,10 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 
 diff --git a/src/main/java/fun/bm/lophinya/compat/LophinyaRidingTeleport.java b/src/main/java/fun/bm/lophinya/compat/LophinyaRidingTeleport.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..1e9dadadf772b9fdb7f9e9d92c1c55d2cb028d01
+index 0000000000000000000000000000000000000000..6f4e28a568b24d56db745c69b8cd377793f640b6
 --- /dev/null
 +++ b/src/main/java/fun/bm/lophinya/compat/LophinyaRidingTeleport.java
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,127 @@
 +package fun.bm.lophinya.compat;
 +
 +/**
@@ -65,8 +65,17 @@ index 0000000000000000000000000000000000000000..1e9dadadf772b9fdb7f9e9d92c1c55d2
 + *       <td>{@code false}, unmoved, <b>still mounted</b></td><td>same - already matches</td></tr>
 + *   <tr><td>teleport the <i>vehicle</i> that has a passenger</td>
 + *       <td>{@code true}, both move, passenger <b>stays mounted</b></td>
-+ *       <td>{@code true}, both move, passenger <b>dropped</b></td></tr>
++ *       <td>{@code true}, both move, passenger <b>stays mounted</b> - see note</td></tr>
 + * </table>
++ *
++ * <p><b>Note on that last row.</b> It was first recorded as "passenger dropped here". That reading
++ * came from an inline, same-tick read on the calling thread, and it was wrong: the platform detaches
++ * the tree, moves it, and re-attaches it, so a read taken immediately after {@code teleport()}
++ * returns catches the gap. Reading the same case on the owning region two ticks later shows the
++ * passenger mounted, at the destination, with the tree intact - identical to Paper, including for
++ * nested passengers, players, cross region, cross world, {@code teleportAsync}, cancellation and a
++ * platform refusal. What genuinely does differ is that the carried passengers get no teleport event;
++ * that is {@link LophinyaPassengerTeleportEvents}.
 + *
 + * <p>So Paper's single-target semantic is exactly: <b>dismount that target, then teleport it</b>.
 + * The vehicle is left alone; other passengers are left alone.
@@ -77,29 +86,24 @@ index 0000000000000000000000000000000000000000..1e9dadadf772b9fdb7f9e9d92c1c55d2
 + * <ul>
 + *   <li>It does not change what {@code TELEPORT_FLAG_TELEPORT_PASSENGERS} means, and does not assume
 + *       the platform's flag condition is inverted - that would be a guess about upstream intent.</li>
-+ *   <li>It does not move vehicle trees. The last row of the table above is a <b>separate</b>
-+ *       divergence (a teleported vehicle drops its passengers here, keeps them on Paper); it is
-+ *       recorded, not fixed here, because deciding how a tree should move is not the same problem.</li>
++ *   <li>It does not move vehicle trees, and does not need to: the platform already moves them the
++ *       way Paper does (see the note on the last row of the table).</li>
 + *   <li>It does not touch cancellation - that row already matches Paper.</li>
 + * </ul>
 + *
 + * <p>Grouped by API symbol, not by plugin: the gap is {@code Entity#teleport} /
 + * {@code Entity#teleportAsync}, and every plugin that teleports a rider hits it identically.
 + *
-+ * <h2>🔴 Known regression - this patch is NOT finished</h2>
-+ * Measured after the change: M1 (same region), M3 (cross region) and M5 ({@code teleportAsync}) now
-+ * match Paper exactly. <b>M4 does not.</b> When a handler cancels the teleport, Paper returns
-+ * {@code false} and the target is <b>still mounted</b>; here the dismount below has already
-+ * happened, so the target ends up unmounted with the teleport refused - a half-broken passenger
-+ * graph, which DEC-59's acceptance explicitly forbids.
++ * <h2>The cancellation case, and why {@link #restoreMount} exists</h2>
++ * The dismount below happens before the platform decides whether the teleport goes ahead, and that
++ * decision includes a handler cancelling the event. Without putting the mount back, a cancelled
++ * teleport would leave the target unmounted <i>and</i> not teleported, where Paper leaves it mounted
++ * - a half-broken passenger graph, which DEC-59's acceptance forbids. Measured after adding the
++ * restore: all four single-target cases (same region, cross region, {@code teleportAsync},
++ * cancelled) match Paper.
 + *
-+ * <p>The cancel decision is made inside the platform's {@code teleportAsync}, after this point, so
-+ * the API boundary cannot see it coming. The fix direction is to restore the mount when the platform
-+ * answers {@code false} - but whether {@code addPassenger} actually restores the same graph Paper
-+ * has must be measured, not assumed.
-+ *
-+ * <p>Kill switch: {@code -Dlophinya.compat.ridingTeleport=false} restores the stock refusal - and is
-+ * the correct setting until M4 is fixed, since stock at least leaves the mount intact.
++ * <p>Kill switch: {@code -Dlophinya.compat.ridingTeleport=false} restores the stock refusal, and was
++ * measured to roll all four back to their pre-patch answers exactly.
 + */
 +public final class LophinyaRidingTeleport {
 +
