@@ -32,10 +32,10 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 
 diff --git a/src/main/java/fun/bm/lophinya/compat/LophinyaTeleportRefusalDiagnostics.java b/src/main/java/fun/bm/lophinya/compat/LophinyaTeleportRefusalDiagnostics.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..e09b18c266f39cdba813e7ae24ada95286255e05
+index 0000000000000000000000000000000000000000..100f06f7217a8091fb1d53c2d62a2b11eaaa6274
 --- /dev/null
 +++ b/src/main/java/fun/bm/lophinya/compat/LophinyaTeleportRefusalDiagnostics.java
-@@ -0,0 +1,150 @@
+@@ -0,0 +1,176 @@
 +package fun.bm.lophinya.compat;
 +
 +import net.minecraft.world.entity.Entity;
@@ -145,13 +145,39 @@ index 0000000000000000000000000000000000000000..e09b18c266f39cdba813e7ae24ada952
 +            return;
 +        }
 +        try {
-+            LOGGER.warn("[Lophinya][D-40] levelCallback {} -> {}  entity={} id={} at={} thread={}",
++            LOGGER.warn("[Lophinya][D-40] levelCallback {} -> {}  entity={} id={} at={} thread={}{}",
 +                wasNull ? "NULL" : "set", isNull ? "NULL" : "set",
 +                entity.getType().toShortString(), entity.getId(), fmt(entity.position()),
-+                Thread.currentThread().getName());
++                Thread.currentThread().getName(), stackSample());
 +        } catch (final Throwable t) {
 +            LOGGER.warn("[Lophinya][D-40] diagnostic itself failed: {}", t.toString());
 +        }
++    }
++
++    /** How many callback transitions still get a stack sample; after that, only the one-liner. */
++    private static final java.util.concurrent.atomic.AtomicInteger STACK_SAMPLES_LEFT =
++        new java.util.concurrent.atomic.AtomicInteger(24);
++
++    /**
++     * The call path of a callback transition, for the first few transitions only.
++     *
++     * <p>The one-liner above says <i>when</i> the callback changed; it never said <i>who</i>. That
++     * left "who sets the callback to NULL, and is it deliberate" answerable only by argument, which
++     * is what four wrong D-40 explanations were made of. A stack is a reading.
++     *
++     * <p>Bounded on purpose: every entity added to a world produces a transition, so an unbounded
++     * stack per transition would cost more than the answer is worth on anything but a probe run.
++     */
++    private static String stackSample() {
++        if (STACK_SAMPLES_LEFT.getAndDecrement() <= 0) {
++            return "";
++        }
++        final StringBuilder sb = new StringBuilder(512).append("\n  called from:");
++        StackWalker.getInstance().walk(frames -> {
++            frames.skip(2).limit(12).forEach(f -> sb.append("\n    ").append(f));
++            return null;
++        });
++        return sb.toString();
 +    }
 +
 +    private static String describeCallback(final Entity entity) {
