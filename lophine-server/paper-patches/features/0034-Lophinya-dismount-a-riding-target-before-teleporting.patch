@@ -27,10 +27,10 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 
 diff --git a/src/main/java/fun/bm/lophinya/compat/LophinyaRidingTeleport.java b/src/main/java/fun/bm/lophinya/compat/LophinyaRidingTeleport.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..c96a1ec1270dd8b6551a82921becd0b14a805268
+index 0000000000000000000000000000000000000000..786a42daeb7c50e392a2c13f126a1b7fe31e5ae7
 --- /dev/null
 +++ b/src/main/java/fun/bm/lophinya/compat/LophinyaRidingTeleport.java
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,98 @@
 +package fun.bm.lophinya.compat;
 +
 +/**
@@ -86,7 +86,20 @@ index 0000000000000000000000000000000000000000..c96a1ec1270dd8b6551a82921becd0b1
 + * <p>Grouped by API symbol, not by plugin: the gap is {@code Entity#teleport} /
 + * {@code Entity#teleportAsync}, and every plugin that teleports a rider hits it identically.
 + *
-+ * <p>Kill switch: {@code -Dlophinya.compat.ridingTeleport=false} restores the stock refusal.
++ * <h2>🔴 Known regression - this patch is NOT finished</h2>
++ * Measured after the change: M1 (same region), M3 (cross region) and M5 ({@code teleportAsync}) now
++ * match Paper exactly. <b>M4 does not.</b> When a handler cancels the teleport, Paper returns
++ * {@code false} and the target is <b>still mounted</b>; here the dismount below has already
++ * happened, so the target ends up unmounted with the teleport refused - a half-broken passenger
++ * graph, which DEC-59's acceptance explicitly forbids.
++ *
++ * <p>The cancel decision is made inside the platform's {@code teleportAsync}, after this point, so
++ * the API boundary cannot see it coming. The fix direction is to restore the mount when the platform
++ * answers {@code false} - but whether {@code addPassenger} actually restores the same graph Paper
++ * has must be measured, not assumed.
++ *
++ * <p>Kill switch: {@code -Dlophinya.compat.ridingTeleport=false} restores the stock refusal - and is
++ * the correct setting until M4 is fixed, since stock at least leaves the mount intact.
 + */
 +public final class LophinyaRidingTeleport {
 +
