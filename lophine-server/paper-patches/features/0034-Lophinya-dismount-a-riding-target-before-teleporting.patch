@@ -1,0 +1,134 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: TinyYana <yanasakuranight@gmail.com>
+Date: Fri, 31 Jul 2026 18:01:07 +0800
+Subject: [PATCH] Lophinya: dismount a riding target before teleporting it,
+ like Paper
+
+Entity#teleportAsync refuses outright when the target is a passenger, and
+CraftEntity#teleportAsync always passes TELEPORT_FLAG_TELEPORT_PASSENGERS, so
+every Bukkit API teleport of a rider returns false and does nothing - boats,
+minecarts, horses, seats, mounts. 25 teleport(...)Z callsites across 9 delivery
+jars, 15 of which discard the return value and cannot even notice.
+
+Paper's semantic, measured with the same probe on both platforms rather than
+assumed: teleporting a passenger dismounts that passenger and moves it, leaving
+the vehicle and any other passengers alone. Cancellation already matches. This
+restores only that single-target semantic, at the API boundary, on the thread
+that owns the entity.
+
+Deliberately not included: the flag's meaning is untouched and no assumption is
+made that its condition is inverted; vehicle trees are not moved. A teleported
+vehicle dropping its passengers here where Paper keeps them mounted is a
+separate divergence, recorded rather than fixed alongside this.
+
+Kill switch: -Dlophinya.compat.ridingTeleport=false
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+diff --git a/src/main/java/fun/bm/lophinya/compat/LophinyaRidingTeleport.java b/src/main/java/fun/bm/lophinya/compat/LophinyaRidingTeleport.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..c96a1ec1270dd8b6551a82921becd0b14a805268
+--- /dev/null
++++ b/src/main/java/fun/bm/lophinya/compat/LophinyaRidingTeleport.java
+@@ -0,0 +1,85 @@
++package fun.bm.lophinya.compat;
++
++/**
++ * Lophinya: restores Paper's answer to "teleport something that is riding something else".
++ *
++ * <h2>The gap</h2>
++ * {@code Entity#teleportAsync} refuses outright when the target is a passenger:
++ *
++ * <pre>
++ *   if ((teleportFlags &amp; TELEPORT_FLAG_TELEPORT_PASSENGERS) != 0L) {
++ *       if (this.isPassenger()) { return false; }
++ *   }
++ * </pre>
++ *
++ * and {@code CraftEntity#teleportAsync} always passes that flag. So every Bukkit API teleport of a
++ * riding entity returns {@code false} and does nothing - boats, minecarts, horses, GSit seats,
++ * Citizens mounts. Measured exposure in the delivery set: 25 {@code teleport(...)Z} callsites across
++ * 9 jars, <b>15 of which discard the return value</b>, so most callers cannot even notice.
++ *
++ * <h2>What Paper does, measured rather than assumed</h2>
++ * Same probe, same jar, Paper 26.2 vs this fork:
++ *
++ * <table>
++ *   <tr><th>case</th><th>Paper</th><th>stock Folia</th></tr>
++ *   <tr><td>teleport the passenger, same region</td>
++ *       <td>{@code true}, moved, <b>dismounted</b></td><td>{@code false}, unmoved, still riding</td></tr>
++ *   <tr><td>teleport the passenger, cross region</td>
++ *       <td>{@code true}, moved, dismounted</td><td>{@code false}, unmoved</td></tr>
++ *   <tr><td>{@code teleportAsync} the passenger</td>
++ *       <td>future {@code true}, dismounted</td><td>future {@code false}</td></tr>
++ *   <tr><td>event cancelled</td>
++ *       <td>{@code false}, unmoved, <b>still mounted</b></td><td>same - already matches</td></tr>
++ *   <tr><td>teleport the <i>vehicle</i> that has a passenger</td>
++ *       <td>{@code true}, both move, passenger <b>stays mounted</b></td>
++ *       <td>{@code true}, both move, passenger <b>dropped</b></td></tr>
++ * </table>
++ *
++ * <p>So Paper's single-target semantic is exactly: <b>dismount that target, then teleport it</b>.
++ * The vehicle is left alone; other passengers are left alone.
++ *
++ * <h2>Scope, deliberately narrow</h2>
++ * This restores <b>only</b> that single-target semantic, at the Bukkit API boundary, and nothing
++ * else:
++ * <ul>
++ *   <li>It does not change what {@code TELEPORT_FLAG_TELEPORT_PASSENGERS} means, and does not assume
++ *       the platform's flag condition is inverted - that would be a guess about upstream intent.</li>
++ *   <li>It does not move vehicle trees. The last row of the table above is a <b>separate</b>
++ *       divergence (a teleported vehicle drops its passengers here, keeps them on Paper); it is
++ *       recorded, not fixed here, because deciding how a tree should move is not the same problem.</li>
++ *   <li>It does not touch cancellation - that row already matches Paper.</li>
++ * </ul>
++ *
++ * <p>Grouped by API symbol, not by plugin: the gap is {@code Entity#teleport} /
++ * {@code Entity#teleportAsync}, and every plugin that teleports a rider hits it identically.
++ *
++ * <p>Kill switch: {@code -Dlophinya.compat.ridingTeleport=false} restores the stock refusal.
++ */
++public final class LophinyaRidingTeleport {
++
++    public static final boolean ENABLED =
++        !"false".equalsIgnoreCase(System.getProperty("lophinya.compat.ridingTeleport", "true"));
++
++    private LophinyaRidingTeleport() {
++    }
++
++    /**
++     * Dismounts {@code entity} from whatever it is riding, if anything.
++     *
++     * <p>Called from {@code CraftEntity#teleportAsync} on the thread that owns the entity, right
++     * before the platform's own teleport - which is where Paper's dismount happens too, and the only
++     * place where the vehicle relationship can be touched safely.
++     *
++     * @return true if a dismount was performed, for the caller's diagnostics
++     */
++    public static boolean dismountForTeleport(final net.minecraft.world.entity.Entity entity) {
++        if (!ENABLED || !entity.isPassenger()) {
++            return false;
++        }
++        // stopRiding() is what the vanilla /tp command already does before teleporting, and what
++        // Paper's Entity#teleport does internally. It detaches this entity from its vehicle and
++        // leaves the vehicle and its other passengers untouched.
++        entity.stopRiding();
++        return true;
++    }
++}
+diff --git a/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java b/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java
+index 0236fb7af19e5ae02891c8d6258fd17bc4ef94a7..44cb620767d5a4353bffcb206183a5b682b7beea 100644
+--- a/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java
++++ b/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java
+@@ -1154,6 +1154,11 @@ public abstract class CraftEntity implements org.bukkit.entity.Entity {
+         // Folia start - region threading
+         java.util.concurrent.CompletableFuture<Boolean> ret = new java.util.concurrent.CompletableFuture<>();
+         java.util.function.Consumer<Entity> run = (Entity nmsEntity) -> {
++            // Lophinya - Paper dismounts a riding target before teleporting it; the platform refuses
++            // outright instead. Restores that one semantic here, on the owning thread, and leaves the
++            // vehicle and any other passengers alone. See LophinyaRidingTeleport for the measured
++            // Paper baseline this follows.
++            fun.bm.lophinya.compat.LophinyaRidingTeleport.dismountForTeleport(nmsEntity);
+             boolean success = nmsEntity.teleportAsync(
+                 ((CraftWorld)locationClone.getWorld()).getHandle(),
+                 new net.minecraft.world.phys.Vec3(locationClone.getX(), locationClone.getY(), locationClone.getZ()),
