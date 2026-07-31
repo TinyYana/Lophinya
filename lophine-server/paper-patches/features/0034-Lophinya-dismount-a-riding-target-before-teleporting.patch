@@ -27,10 +27,10 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 
 diff --git a/src/main/java/fun/bm/lophinya/compat/LophinyaRidingTeleport.java b/src/main/java/fun/bm/lophinya/compat/LophinyaRidingTeleport.java
 new file mode 100644
-index 0000000000000000000000000000000000000000..786a42daeb7c50e392a2c13f126a1b7fe31e5ae7
+index 0000000000000000000000000000000000000000..1e9dadadf772b9fdb7f9e9d92c1c55d2cb028d01
 --- /dev/null
 +++ b/src/main/java/fun/bm/lophinya/compat/LophinyaRidingTeleport.java
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,123 @@
 +package fun.bm.lophinya.compat;
 +
 +/**
@@ -116,21 +116,46 @@ index 0000000000000000000000000000000000000000..786a42daeb7c50e392a2c13f126a1b7f
 +     * before the platform's own teleport - which is where Paper's dismount happens too, and the only
 +     * place where the vehicle relationship can be touched safely.
 +     *
-+     * @return true if a dismount was performed, for the caller's diagnostics
++     * @return the vehicle it was riding, so the caller can put it back if the teleport is refused,
++     *         or {@code null} if it was not riding anything
 +     */
-+    public static boolean dismountForTeleport(final net.minecraft.world.entity.Entity entity) {
++    public static net.minecraft.world.entity.Entity dismountForTeleport(final net.minecraft.world.entity.Entity entity) {
 +        if (!ENABLED || !entity.isPassenger()) {
-+            return false;
++            return null;
 +        }
++        final net.minecraft.world.entity.Entity vehicle = entity.getVehicle();
 +        // stopRiding() is what the vanilla /tp command already does before teleporting, and what
 +        // Paper's Entity#teleport does internally. It detaches this entity from its vehicle and
 +        // leaves the vehicle and its other passengers untouched.
 +        entity.stopRiding();
-+        return true;
++        return vehicle;
++    }
++
++    /**
++     * Puts the entity back on the vehicle after a teleport the platform refused.
++     *
++     * <p>Needed because the refusal can come from a handler cancelling the event, and that decision
++     * is made inside the platform's {@code teleportAsync} - after the dismount above. Without this,
++     * a cancelled teleport leaves the target unmounted with the teleport not performed, where Paper
++     * leaves it mounted: a half-broken passenger graph, and measurably different from Paper (case M4
++     * of the vehicle matrix).
++     *
++     * <p>Does nothing when there was no vehicle, or when the entity has since become a passenger of
++     * something else - re-seating over a newer relationship would be worse than leaving it alone.
++     */
++    public static void restoreMount(final net.minecraft.world.entity.Entity entity,
++                                    final net.minecraft.world.entity.Entity vehicle) {
++        if (vehicle == null || entity.isPassenger() || entity.isRemoved() || vehicle.isRemoved()) {
++            return;
++        }
++        // force=true because the original mount already passed whatever checks applied; the third
++        // argument is false so putting the entity back does not fire a second mount event - nothing
++        // observable actually changed from a plugin's point of view.
++        entity.startRiding(vehicle, true, false);
 +    }
 +}
 diff --git a/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java b/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java
-index 0236fb7af19e5ae02891c8d6258fd17bc4ef94a7..44cb620767d5a4353bffcb206183a5b682b7beea 100644
+index 0236fb7af19e5ae02891c8d6258fd17bc4ef94a7..13d74fa8fb561d3f45db27402fc3f12d8656aab8 100644
 --- a/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java
 +++ b/src/main/java/org/bukkit/craftbukkit/entity/CraftEntity.java
 @@ -1154,6 +1154,11 @@ public abstract class CraftEntity implements org.bukkit.entity.Entity {
@@ -141,7 +166,18 @@ index 0236fb7af19e5ae02891c8d6258fd17bc4ef94a7..44cb620767d5a4353bffcb206183a5b6
 +            // outright instead. Restores that one semantic here, on the owning thread, and leaves the
 +            // vehicle and any other passengers alone. See LophinyaRidingTeleport for the measured
 +            // Paper baseline this follows.
-+            fun.bm.lophinya.compat.LophinyaRidingTeleport.dismountForTeleport(nmsEntity);
++            final Entity lophinyaVehicle = fun.bm.lophinya.compat.LophinyaRidingTeleport.dismountForTeleport(nmsEntity);
              boolean success = nmsEntity.teleportAsync(
                  ((CraftWorld)locationClone.getWorld()).getHandle(),
                  new net.minecraft.world.phys.Vec3(locationClone.getX(), locationClone.getY(), locationClone.getZ()),
+@@ -1165,6 +1170,10 @@ public abstract class CraftEntity implements org.bukkit.entity.Entity {
+                 }
+             );
+             if (!success) {
++                // Lophinya - the refusal may be a handler cancelling the event, which the platform
++                // decides after the dismount above. Paper leaves a cancelled target mounted, so put
++                // it back rather than leaving a half-broken passenger graph.
++                fun.bm.lophinya.compat.LophinyaRidingTeleport.restoreMount(nmsEntity, lophinyaVehicle);
+                 ret.complete(Boolean.FALSE);
+             }
+         };
