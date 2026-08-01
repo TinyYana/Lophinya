@@ -33,7 +33,7 @@ UNKNOWN by default.
 Kill switch: -Dlophinya.compat.teleportEvents=false
 
 diff --git a/net/minecraft/world/entity/Entity.java b/net/minecraft/world/entity/Entity.java
-index 489011f9af49fa3407038bd2f00439443307d179..30eda19870518d3730843048461f8f95e5ccccc4 100644
+index 340e6ad83ba93f3927a08a107e3c8dbafa546112..4f602080b4121a4082c591d3c5fae884c4066854 100644
 --- a/net/minecraft/world/entity/Entity.java
 +++ b/net/minecraft/world/entity/Entity.java
 @@ -4405,6 +4405,17 @@ public abstract class Entity

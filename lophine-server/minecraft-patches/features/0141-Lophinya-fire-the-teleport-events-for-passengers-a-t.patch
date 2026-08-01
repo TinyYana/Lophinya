@@ -22,7 +22,7 @@ Kill switch: -Dlophinya.compat.passengerTeleportEvents=false
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 
 diff --git a/net/minecraft/world/entity/Entity.java b/net/minecraft/world/entity/Entity.java
-index 30eda19870518d3730843048461f8f95e5ccccc4..e503099c51b50d9585465a4497e8e3f98a2e0ff5 100644
+index 4f602080b4121a4082c591d3c5fae884c4066854..6d7281fe521901c502379a02f80d9fef54db11e2 100644
 --- a/net/minecraft/world/entity/Entity.java
 +++ b/net/minecraft/world/entity/Entity.java
 @@ -4595,6 +4595,14 @@ public abstract class Entity
