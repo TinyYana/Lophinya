@@ -38,10 +38,28 @@ public class FoliaServerWaypointManager extends ServerWaypointManager {
         }
     }
 
+    // Lophinya start - implement remakeConnections instead of throwing
+    // "Unused" was wrong: ServerScoreboard.updatePlayerWaypoint/updateTeamWaypoints call this for
+    // every team-membership or team-color change of an online player (locator bar waypoints are
+    // team-colored), so the vanilla /team command and any plugin team change crashed the caller
+    // here. Mirror vanilla ServerWaypointManager: recreate the connection for every tracking
+    // player; createConnection already hops to the player's owning region via scheduleIfOffTarget.
+    private static final boolean REMAKE_CONNECTIONS =
+        !"false".equalsIgnoreCase(System.getProperty("lophinya.compat.waypointRemakeConnections", "true"));
+
     @Override
     public void remakeConnections(WaypointTransmitter waypoint) {
-        throw new UnsupportedOperationException("Unused");
+        if (!REMAKE_CONNECTIONS) {
+            throw new UnsupportedOperationException("Unused");
+        }
+        if (!CommandConfig.waypointsAndWaypointCommand) {
+            return;
+        }
+        for (ServerPlayer player : this.trackingPlayers) {
+            this.createConnection(player, waypoint);
+        }
     }
+    // Lophinya end - implement remakeConnections instead of throwing
 
     @Override
     public Set<WaypointTransmitter> transmitters() {
