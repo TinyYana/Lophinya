@@ -1,0 +1,195 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: TinyYana <yanasakuranight@gmail.com>
+Date: Mon, 3 Aug 2026 23:22:28 +0800
+Subject: [PATCH] Lophinya: answer a cross-region block read from a resident
+ chunk
+
+Reading another region's - or another world's - block synchronously has no legal
+thread on this platform: every ServerLevel builds its own regioniser, so a thread
+ticking a region in world A can never own a chunk in world B. Multiverse's
+destination safety scan dies on exactly this, leaving /mvtp usable only with
+--unsafe, i.e. with the safety scan skipped.
+
+The blanket refusal in CraftBlock guards two things and only one is still real for
+a read. Triggering a chunk load off-thread is real and is kept: this answers only
+from an already-resident chunk and otherwise falls through to the stock check.
+Racing a concurrent writer is not, with one narrow exception handled below:
+PalettedContainer.data is volatile, every mutator is synchronized, a resize
+publishes a new Data rather than editing the old one, and Paper deliberately
+disabled the ThreadingDetector in favour of proper synchronization.
+
+The exception is that readPalette indexes the palette's live backing array
+(LinearPalette's moonrise$getRawPalette returns this.values) and a writer appends
+there before writing the storage index, both as plain writes - so a reader can see
+the new index while the slot still reads null. That is caught and turned back into
+the stock ownership failure, so the worst case is the pre-patch behaviour with the
+platform's own attributable message. A stale read cannot be silently wrong, only
+stale: palette entries are append-only within one Data.
+
+Writes are untouched, non-tick threads still fail so the async catcher keeps
+working, and -Dlophinya.compat.crossRegionBlockRead=false restores the refusal.
+
+diff --git a/src/main/java/fun/bm/lophinya/compat/LophinyaCrossRegionBlockRead.java b/src/main/java/fun/bm/lophinya/compat/LophinyaCrossRegionBlockRead.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..583f8d64597b6b20d3caac1b52f85ba5a9374139
+--- /dev/null
++++ b/src/main/java/fun/bm/lophinya/compat/LophinyaCrossRegionBlockRead.java
+@@ -0,0 +1,138 @@
++package fun.bm.lophinya.compat;
++
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++import net.minecraft.core.BlockPos;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.level.block.Blocks;
++import net.minecraft.world.level.block.state.BlockState;
++import net.minecraft.world.level.chunk.LevelChunk;
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++
++/**
++ * Lophinya: serve a <em>read-only</em> block lookup from an already-loaded chunk when the calling
++ * tick thread does not own that chunk's region, instead of refusing it.
++ *
++ * <p>Reading another region's - or another world's - block synchronously is a very common Paper
++ * idiom, and on this platform it is not merely inconvenient but structurally impossible to satisfy:
++ * every {@code ServerLevel} builds its own regioniser, so a thread ticking a region in world A can
++ * never be the tick thread for any chunk in world B. Multiverse's destination scan and its world
++ * creation both die on exactly this, and there is no thread the plugin could have used instead.
++ *
++ * <h2>Why this is narrowing the check rather than disabling it</h2>
++ *
++ * The blanket refusal in {@code CraftBlock} guards two different things, and only one of them is
++ * still real for a read:
++ *
++ * <ol>
++ *   <li><b>Triggering a chunk load off-thread.</b> Real, and kept: this only answers from
++ *       {@code getChunkAtIfLoadedImmediately}, and returns {@code null} - so the caller throws
++ *       exactly as before - when the chunk is not already resident. Nothing here can load,
++ *       generate, or tick a chunk.</li>
++ *   <li><b>Racing a concurrent writer on the block data.</b> Upstream has already made this safe.
++ *       {@code PalettedContainer.data} is {@code volatile} and every mutator is {@code synchronized};
++ *       a resize publishes a brand new {@code Data} rather than editing the old one; and Paper
++ *       deliberately disabled the {@code ThreadingDetector} with the comment "use proper
++ *       synchronization". A reader therefore takes one consistent snapshot and indexes into it.
++ *       {@code LevelChunk.getBlockStateFinal} adds only a bounds check and a plain int read.</li>
++ * </ol>
++ *
++ * So the worst outcome of a read served here is a block state that is one tick stale - which is the
++ * same thing every check-then-act plugin already races against on single-threaded Paper. It cannot
++ * throw, cannot deadlock, cannot corrupt, and cannot observe a torn value: entries never span two
++ * longs in {@code SimpleBitStorage}, so a concurrent write is seen either wholly or not at all.
++ *
++ * <p><b>Writes are untouched.</b> {@code CraftBlock}'s "Cannot modify world asynchronously" check and
++ * {@code LevelChunk.setBlockState}'s check are exactly as upstream wrote them.
++ *
++ * <p><b>Tick threads only.</b> Threads that are not tick threads at all - a plugin's own async pool -
++ * still fail, so the async catcher keeps working as a diagnostic. Both cases this was written for
++ * are tick threads: a region thread reading another world, and the global region thread, which owns
++ * no chunks and therefore cannot legally read any block anywhere.
++ *
++ * <p>Nothing here is per-plugin: no plugin name, jar hash or call-site list.
++ *
++ * <p>Kill switch: {@code -Dlophinya.compat.crossRegionBlockRead=false} restores the stock refusal.
++ */
++public final class LophinyaCrossRegionBlockRead {
++
++    private static final Logger LOGGER = LogManager.getLogger(LophinyaCrossRegionBlockRead.class);
++
++    private static final boolean ENABLED =
++        !"false".equalsIgnoreCase(System.getProperty("lophinya.compat.crossRegionBlockRead", "true"));
++
++    /** One diagnostic line per distinct world pair, so the behaviour is observable without flooding. */
++    private static final Set<String> REPORTED = ConcurrentHashMap.newKeySet();
++
++    private LophinyaCrossRegionBlockRead() {
++    }
++
++    /**
++     * Reads a block state without owning its region, if that can be done without loading anything.
++     *
++     * @return the block state, or {@code null} to let the caller apply the stock ownership check
++     */
++    public static BlockState readIfResident(final ServerLevel level, final BlockPos pos) {
++        if (!ENABLED || !ca.spottedleaf.moonrise.common.util.TickThread.isTickThread()) {
++            return null;
++        }
++        if (level.isOutsideBuildHeight(pos)) {
++            return Blocks.VOID_AIR.defaultBlockState();
++        }
++        final int chunkX = pos.getX() >> 4;
++        final int chunkZ = pos.getZ() >> 4;
++        LevelChunk chunk = level.getChunkSource().getChunkAtIfLoadedImmediately(chunkX, chunkZ);
++        if (chunk == null) {
++            // A chunk can be fully loaded and held by its holder without yet being published into
++            // fullChunks - which is the state a freshly created or freshly loaded world is in right
++            // after its spawn area is prepared. Upstream's own comment on this accessor is "Note:
++            // Bypass cache since we need to check ticket level, and to make this MT-Safe", so it is
++            // the correct primitive here; it still returns null when nothing is resident.
++            chunk = level.getChunkSource().getChunkAtIfCachedImmediately(chunkX, chunkZ);
++        }
++        if (chunk == null) {
++            return null;
++        }
++        try {
++            final BlockState state = chunk.getBlockState(pos);
++            report(level);
++            return state;
++        } catch (final IllegalArgumentException | IndexOutOfBoundsException race) {
++            // The one hole in the "a concurrent read is safe" argument, and it is narrow but real:
++            // PalettedContainer.readPalette indexes the palette's LIVE backing array
++            // (LinearPalette.moonrise$getRawPalette returns `this.values`), and a writer appends the
++            // new entry to that array before writing the storage index. Both are plain writes, so an
++            // unsynchronised reader can observe the new index while the palette slot still reads
++            // null - which readPalette turns into "Palette index out of bounds". It can only happen
++            // while this very section gains a block type it did not have.
++            //
++            // Falling through is not swallowing it: the caller then hits the stock ownership check
++            // and fails exactly as it does today, loudly and with a message that names the world and
++            // position. Trading an unattributable exception for the platform's own is the point.
++            //
++            // A stale read cannot be silently wrong, only stale: palette entries are append-only
++            // within one Data, and a resize publishes a whole new Data, so an old index always still
++            // maps to the value it mapped to.
++            LOGGER.warn("[Lophinya] Cross-region block read raced a palette update at {} in {}; "
++                + "falling through to the stock ownership check", pos, level.getWorld().getName(), race);
++            return null;
++        }
++    }
++
++    private static void report(final ServerLevel level) {
++        final boolean global = io.papermc.paper.threadedregions.TickRegionScheduler.getCurrentRegion() == null;
++        final String key = (global ? "global region" : "a region thread") + " -> " + level.getWorld().getName();
++        if (REPORTED.add(key)) {
++            LOGGER.info("""
++                [Lophinya] Served a cross-region block read from a resident chunk: {}
++                  why     : every world has its own regioniser, so a tick thread can never own another \
++                world's chunks - this read has no legal thread and would otherwise be impossible, not \
++                merely misplaced.
++                  safety  : resident chunks only (an absent chunk still throws, so nothing loads here), \
++                reads only (writes are unchanged), and PalettedContainer is already concurrent-read \
++                safe upstream. Worst case is a one-tick-stale block state.
++                  disable : -Dlophinya.compat.crossRegionBlockRead=false""", key);
++        }
++    }
++}
+diff --git a/src/main/java/org/bukkit/craftbukkit/block/CraftBlock.java b/src/main/java/org/bukkit/craftbukkit/block/CraftBlock.java
+index 0b6280d369a2a06a8736f22f11923bc6fdce4e06..016c810c1ad9c5df50c94b1701f8eba421e497a8 100644
+--- a/src/main/java/org/bukkit/craftbukkit/block/CraftBlock.java
++++ b/src/main/java/org/bukkit/craftbukkit/block/CraftBlock.java
+@@ -80,6 +80,15 @@ public class CraftBlock implements Block {
+     public net.minecraft.world.level.block.state.BlockState getBlockState() {
+         // Folia start - region threading
+         if (this.level instanceof ServerLevel serverWorld) {
++            // Lophinya start - serve a read-only lookup from a resident chunk instead of refusing it
++            if (!ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(serverWorld, this.position)) {
++                final net.minecraft.world.level.block.state.BlockState resident =
++                    fun.bm.lophinya.compat.LophinyaCrossRegionBlockRead.readIfResident(serverWorld, this.position);
++                if (resident != null) {
++                    return resident;
++                }
++            }
++            // Lophinya end
+             ca.spottedleaf.moonrise.common.util.TickThread.ensureTickThread(serverWorld, this.position, "Cannot read world asynchronously");
+         }
+         // Folia end - region threading
