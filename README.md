@@ -1,91 +1,91 @@
-<div align="center">
-
 # Lophinya
 
-**讓既有的 Paper／Spigot 插件，以原本的 binary、設定與資料，在 Folia 的 region 架構上安全運作。**
+`Paper` → `Folia` → [`Lophine`](https://github.com/LophineLabs/Lophine) → `Lophinya`
 
-`Paper` → `Folia` → [`Lophine`](https://github.com/LophineLabs/Lophine) → **`Lophinya`**
+Folia 把世界切成好幾個 region 並行跑，效能是上去了，代價是既有插件幾乎全部要重寫。
+官方自己講得很直白：對現有插件的相容性預期是零。
 
-</div>
+Lophinya 就是在處理這件事。一層核心的相容墊片，讓沒有官方 Folia 版本的插件，
+用原本的 jar、原本的設定、原本的資料，直接在 Folia 上跑。
 
----
-
-## 這是什麼
-
-Lophinya 是 [Lophine](https://github.com/LophineLabs/Lophine) 的 fork，為 Lycohinya 伺服器而做。
-
-Folia 把世界切成多個 region 並行 tick，效能因此上得去，代價是**幾乎所有既有插件都要改寫**才能跑。
-官方的說法很直接：對現有插件的相容性預期是零。
-
-Lophinya 的核心產品就是處理這件事——**一層核心相容墊片**，讓那些沒有官方 Folia 版本的插件，
-**不用改一行原始碼、不用換 jar、不用搬設定與資料**，就能在 Folia 上正確運作。
-
-## 這不是什麼
-
-- ❌ **不承諾支援整個 Paper／Spigot 生態。** 它是為一台實際運作的伺服器做的，不是通用發行版。
-- ❌ **不是效能 fork。** 效能來自 Folia 與 Lophine，Lophinya 加的全部是相容性。
-- ❌ **不提供支援。** 你可以自由使用，但請不要期待 issue 會被處理。
+如果這個東西對你有用，給顆 Star 吧，我會很開心。⭐
 
 ---
 
-## 三條設計原則
+## 先講清楚它不做什麼
 
-這三條決定了程式碼長什麼樣，也決定了哪些做法被拒絕。
+這是為 Lycohinya 這台伺服器做的，不是通用發行版。所以：
 
-### 1. 核心不得內建 per-plugin 清單
+它不承諾支援整個 Paper／Spigot 生態。目標是「任何 Paper 插件丟上去都能跑」沒錯，
+但實際被驗證過的只有那台伺服器真的在用的東西。
 
-任何「插件更新、換版本、裝新插件就要改核心程式碼」的設計都是錯的——那等於把每個插件的決定權
-交給建置核心的人，於是「支援任何 Paper 插件」實際上變成「支援有人記得去 vet 過的插件」，
-營運者也沒辦法在不等核心 release 的情況下裝新插件。
+它也不是效能 fork。效能全部來自 Folia 跟 Lophine，這一層加的東西只有相容性，
+而且相容性通常是拿效能去換的。
 
-### 2. 程式碼層面不拒絕任何插件
+然後我大概不會處理 issue。你可以自由拿去用，但別期待有人回。
 
-沒有 jar 黑名單，沒有插件白名單，**連可設定的清單都沒有**。
-已知會出問題的插件，該做的是把知識寫成文件讓人自己判斷，不是寫成伺服器程式碼去強制執行。
-**載入失敗就讓它失敗——把失敗變成功才是這個專案要做的事。**
+## 三條規則
 
-### 3. 每一層墊片都要能整層關掉
+這三條不是理念宣傳，是實際上砍掉過很多寫法的東西。
 
-所有相容性修改都掛在系統屬性後面，預設開啟，關掉之後行為**逐字**回到未修改的上游。
-出事的時候，第一件事永遠是「先關掉再說」，而不是「先查是誰的錯」。
+**核心裡不能有 per-plugin 清單。** 一旦變成「插件升版、換版本、裝新的就要改核心程式碼」，
+那「支援任何 Paper 插件」實際上就變成「支援有人記得去 vet 過的插件」，
+而且營運的人要裝新插件還得等我出 release。這不合理。
 
----
+**程式碼層面不拒絕任何插件。** 沒有 jar 黑名單，沒有白名單，可設定的清單也不行——
+可設定只是把決定權搬走，機制還是交付出去了，等於背書「拒絕插件」是正常做法。
+已知會出事的插件，寫進文件讓人自己判斷就好。載入失敗就讓它失敗，
+把失敗變成功才是這裡要做的事。
 
-## 相容墊片處理了哪些問題
+**每一層都要能整層關掉。** 所有改動都掛在系統屬性後面，預設開，關掉之後行為逐字回到上游。
+出事的時候第一件事是先關掉，不是先查是誰的錯。
 
-依主題分組，不逐一列出 patch。全部都是通用機制，不含任何插件名稱。
+## 目前處理了哪些東西
 
-| 主題 | 處理的問題 |
-|---|---|
-| **排程器** | 被 region 架構拒絕的 Bukkit 同步排程任務，改以呼叫端**當下真實的**上下文派送到正確的 region；async 任務在建構當下捕捉它是從哪裡被建立的，而不是從內容去猜 |
-| **傳送** | 補回 Folia 未觸發的 `PlayerTeleportEvent`／`EntityTeleportEvent`／`PlayerChangedWorldEvent`；修正騎乘中的實體無法被傳送、跨 region 交接、乘客事件與跨世界座標 |
-| **方塊讀取** | 跨 region／跨世界的**唯讀**方塊查詢改由已常駐的區塊回答；區塊不在記憶體時仍照原樣大聲失敗 |
-| **啟動期** | 啟動執行緒在 region ticking 尚未開始前被視為全域狀態的合法擁有者——這是 Paper 主執行緒在同一時點的處境，也是極常見的 Bukkit 慣用法 |
-| **指令派送** | console 身分在 region 執行緒上的指令派送交回 global region，解析仍留在呼叫端以保留同步回傳值 |
-| **經濟與權限** | 經濟 provider 的 per-account 序列化；補完上游對權限管理器同步化時漏掉的方法 |
-| **計分板** | 以符合 Folia 規則的方式開放 Bukkit scoreboard API：插件自有計分板可在任何 tick 執行緒操作，主計分板的結構性變更要求 global 執行緒，玩家指派要求擁有該玩家的執行緒——**一律大聲失敗，絕不猜測 owner** |
-| **診斷** | 被拒絕的排程與 off-region 讀取都會印出可歸因的來源（jar、呼叫點、world、座標），而不是丟一個沒有上下文的 NPE |
-| **相容閘門** | `folia-supported` 閘門預設**全部放行**，讓任何 Paper 插件都能載入；不能跑的就在真正的呼叫點失敗 |
+不逐個 patch 列，按主題分。全部是通用機制，程式碼裡沒有任何插件名稱。
 
-### 硬性不做的事
+**排程器**——被 region 架構拒絕的 Bukkit 同步任務，改用呼叫端當下真實的上下文派到對的 region。
+async 任務則是在建構的那一刻捕捉「它是從哪裡被建立的」，而不是去猜 Runnable 裡面在做什麼。
 
-- 不關閉、不繞過、不吞掉 Folia 的 thread ownership 檢查（**寫入側一律原封不動**）
-- 不把任意同步任務丟給 `GlobalRegionScheduler`
-- 不從沒有上下文的 `Runnable` 猜 region owner
-- 不偽造平台狀態去讓檢查通過
+**傳送**——Folia 沒發的 `PlayerTeleportEvent`／`EntityTeleportEvent`／`PlayerChangedWorldEvent` 補回來。
+另外還有騎乘中的實體完全無法被傳送、跨 region 交接、乘客事件、跨世界座標偏移這幾個。
 
----
+**方塊讀取**——跨 region 或跨世界的唯讀查詢，改由已經在記憶體裡的區塊回答。
+區塊不在的話照舊大聲失敗，因為那需要載入，而那是另一回事。
+
+**啟動期**——region 還沒開始 tick 之前，啟動執行緒本來就是全域狀態的唯一存取者。
+那正是 Paper 主執行緒在同一時點的處境，而在 Paper 上這些插件呼叫是完全正常的做法。
+
+**指令派送**——console 身分在 region 執行緒上的派送交回 global region，
+但解析留在呼叫端，這樣同步回傳值才保得住。
+
+**經濟與權限**——經濟 provider 的 per-account 序列化，還有補完上游同步化權限管理器時漏掉的兩個方法。
+
+**計分板**——按 Folia 自己的規則開放：插件自有計分板任何 tick 執行緒都行，
+主計分板的結構性變更要 global 執行緒，玩家指派要擁有那個玩家的執行緒。一律大聲失敗，不猜 owner。
+
+**診斷**——被拒絕的排程跟 off-region 讀取會印出 jar、呼叫點、world、座標。
+在這種平台上，一個沒有上下文的 NPE 等於沒有資訊。
+
+### 不做的四件事
+
+不關掉、不繞過、不吞掉 Folia 的 thread ownership 檢查（寫入那一側一行都沒動）。
+不把任意同步任務丟給 `GlobalRegionScheduler`。
+不從沒有上下文的 `Runnable` 去猜 region owner。
+不偽造平台狀態去讓檢查通過。
+
+那些檢查不是障礙。沒有它們，這裡每一個問題都會變成無法重現的資料競態。
 
 ## Kill switch
 
-全部預設開啟，加 `=false` 關閉，以 `-D` 傳給 JVM：
+預設全開，加 `=false` 關掉，用 `-D` 傳給 JVM：
 
 ```
 -Dlophinya.compat.crossRegionBlockRead=false
 ```
 
 <details>
-<summary>完整清單</summary>
+<summary>全部 24 個</summary>
 
 | 屬性 | 關掉之後 |
 |---|---|
@@ -116,26 +116,24 @@ Lophinya 的核心產品就是處理這件事——**一層核心相容墊片**�
 
 </details>
 
----
-
 ## 建置
 
-需要 **Java 25**。
+要 Java 25。
 
 ```bash
-./gradlew applyAllPatches                      # 首次會 clone 上游，很慢
+./gradlew applyAllPatches                      # 第一次會去 clone 上游，很慢
 BUILD_NUMBER=1 ./gradlew createPaperclipJar    # → lophine-server/build/libs/*-paperclip-*.jar
 ```
 
-> ⚠ 測插件相容性時**一定要設 `BUILD_NUMBER`**。沒設的話版本字串是 `local-SNAPSHOT`，
-> 部分插件會據此判定不相容而自我停用，你會得到錯誤的結論。
+`BUILD_NUMBER` 一定要設。沒設的話版本字串會是 `local-SNAPSHOT`，
+有些插件會據此判定不相容然後自我停用，你會得到完全錯的結論——這個坑我踩過。
 
-Windows 上請先設好 repo-local 的 `core.autocrlf=false` 與 `core.longpaths=true`，
-否則 `.patch` 會被轉成 CRLF 而套用失敗。
+Windows 上先把 repo-local 的 `core.autocrlf` 設成 `false`、`core.longpaths` 設成 `true`，
+不然 `.patch` 會被轉成 CRLF，套用直接壞掉。
 
 ## API
 
-沿用上游 Lophine 的 API 座標：
+沿用上游 Lophine 的座標：
 
 ```kotlin
 repositories { maven("https://repo.bacteriawa.com/repository/maven-public/") }
@@ -143,24 +141,22 @@ dependencies { compileOnly("fun.bm.lophine:lophine-api:26.2.build.+") }
 java { toolchain.languageVersion.set(JavaLanguageVersion.of(25)) }
 ```
 
----
-
 ## 致謝
 
-Lophinya 站在四層別人的工作上面，**這個 fork 自己只做最上面那一層**。
+這個 fork 只做最上面那一層，下面全是別人的東西。
 
-- **[PaperMC](https://github.com/PaperMC/Paper)** — Paper 與 Folia。region 化的多執行緒設計是這一切的前提，
-  而這個 fork 所有的難題也都源自它把「單一主執行緒」這個假設拿掉了。
-- **[Folia](https://github.com/PaperMC/Folia)** — 本專案**刻意不去繞過**它的 thread ownership 檢查。
-  那些檢查不是障礙，是唯一讓「哪裡不安全」變得看得見的東西；
-  沒有它們，這裡每一個問題都會變成無法重現的資料競態。
-- **[LophineLabs／Lophine](https://github.com/LophineLabs/Lophine)** — 直接上游。
-  生電行為的可再現性、可設定的原版特性，以及大量 Folia bug 修復都來自它。
-- **Luminol、Leaves** 等被 Lophine vendored 的專案 — 其中的 region API 與世界熱載入
-  是本專案數個相容性修正得以成立的基礎。
+[**PaperMC**](https://github.com/PaperMC/Paper) 的 Paper 與 [**Folia**](https://github.com/PaperMC/Folia)——
+region 化的設計是這一切的前提，而這裡所有的難題也都是因為它把「單一主執行緒」這個假設拿掉了。
+Folia 的 thread ownership 檢查我是刻意不去繞的，那些檢查是唯一讓「哪裡不安全」看得見的東西。
 
-上游的 issue 請回報到上游，不要送到這裡。
+[**LophineLabs／Lophine**](https://github.com/LophineLabs/Lophine)——直接上游。
+生電行為的可再現性、可設定的原版特性、還有一大堆 Folia bug 修復都是它做的。
+
+**Luminol**、**Leaves** 這些被 Lophine vendored 進來的專案——裡面的 region API 跟世界熱載入，
+是這邊好幾個相容性修正能成立的基礎。
+
+上游的 issue 請回報到上游，不要送來這裡。
 
 ## 授權
 
-繼承自上游專案，見 [`LICENSE.md`](LICENSE.md)。
+繼承自上游，見 [`LICENSE.md`](LICENSE.md)。
