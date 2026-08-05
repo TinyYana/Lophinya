@@ -1,4 +1,4 @@
-name: Lophine CI
+name: Lophinya CI
 
 on:
   push:
@@ -14,7 +14,7 @@ on:
         required: false
         default: ""
       force-push:
-        description: "Force disable push to repo if you enter false, force push to repo if you enter true, default push if not released else skip push repo"
+        description: "Force disable push to repo if you enter false, force push if not released else skip push repo"
         required: false
         default: ""
       comments:
@@ -58,7 +58,7 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ env.project_id_b }} CI Artifacts
+          name: Lophinya CI Artifacts
           path: lophine-server/build/libs/*-paperclip-*.jar
 
       - name: Set Environment
@@ -124,7 +124,7 @@ jobs:
           tag: ${{ env.tag }}
           name: ${{ env.project_id_b }} ${{ env.mcversion }} - ${{ env.commit_id }}${{ env.release_count }}
           body: |
-            📦Version: `${{ env.mcversion }}` | Commit ${{ env.commit_id }} [![download](https://img.shields.io/github/downloads/LophineLabs/${{ env.project_id }}/${{ env.tag }}/total?color=red&style=flat-square)](https://github.com/LophineLabs/${{ env.project_id }}/releases/download/${{ env.tag }}/${{ env.jar }})
+            📦Version: `${{ env.mcversion }}` | Commit ${{ env.commit_id }} [![download](https://img.shields.io/github/downloads/${{ github.repository }}/${{ env.tag }}/total?color=red&style=flat-square)](https://github.com/${{ github.repository }}/releases/download/${{ env.tag }}/${{ env.jar }})
             This release is automatically compiled by GitHub Actions
             ### Branch Info
             > ${{ github.ref_name }}
@@ -143,7 +143,7 @@ jobs:
           tag: ${{ env.tag }}
           name: ${{ env.project_id_b }} ${{ env.mcversion }} - ${{ env.commit_id }}${{ env.release_count }}
           body: |
-            📦Version: `${{ env.mcversion }}` | Commit ${{ env.commit_id }} [![download](https://img.shields.io/github/downloads/LophineLabs/${{ env.project_id }}/${{ env.tag }}/total?color=red&style=flat-square)](https://github.com/LophineLabs/${{ env.project_id }}/releases/download/${{ env.tag }}/${{ env.jar }})
+            📦Version: `${{ env.mcversion }}` | Commit ${{ env.commit_id }} [![download](https://img.shields.io/github/downloads/${{ github.repository }}/${{ env.tag }}/total?color=red&style=flat-square)](https://github.com/${{ github.repository }}/releases/download/${{ env.tag }}/${{ env.jar }})
             This release is automatically compiled by GitHub Actions
             ### Comments
             > ${{ inputs.comments }}
