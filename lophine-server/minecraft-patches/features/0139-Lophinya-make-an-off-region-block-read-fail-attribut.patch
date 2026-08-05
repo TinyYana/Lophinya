@@ -20,7 +20,7 @@ soak run, all from CraftWorld#rayTraceBlocks off-region.
 Kill switch: -Dlophinya.compat.regionReadDiagnostics=false
 
 diff --git a/net/minecraft/world/level/Level.java b/net/minecraft/world/level/Level.java
-index 55d83a1a97077033191f0f0c220e99095f2a314d..ccff6174a3ea7ac60ac6157956057cec672bdd02 100644
+index ca92bb3a8b739c0da3f48a2dd16c5fb4fa7e8453..97465a24485f3636dc34c74840b2374ebe78dc66 100644
 --- a/net/minecraft/world/level/Level.java
 +++ b/net/minecraft/world/level/Level.java
 @@ -1012,6 +1012,11 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
