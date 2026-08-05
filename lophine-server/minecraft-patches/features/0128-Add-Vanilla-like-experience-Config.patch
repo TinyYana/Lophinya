@@ -21,7 +21,7 @@ index dd17339fe2f9d7660b20eed05b61d6231302aa82..d997e4f7ae6ee4e81f5fffe874f2895d
      }
  
 diff --git a/net/minecraft/server/level/ServerPlayer.java b/net/minecraft/server/level/ServerPlayer.java
-index 9a6f18fd0eb7e2aef174b25d14cfd0f5a3ade6af..b43bbe461500782a75a49c9238bd4d4d81448d09 100644
+index 9e8157e6a6df32d00fd1f689a6005ce0f7e0dfbd..2da765eb74c4e84254857ad05b7af82eb8500fc3 100644
 --- a/net/minecraft/server/level/ServerPlayer.java
 +++ b/net/minecraft/server/level/ServerPlayer.java
 @@ -2339,7 +2339,7 @@ public class ServerPlayer extends Player implements ca.spottedleaf.moonrise.patc
@@ -99,7 +99,7 @@ index 6130c477349096d5912dce859b616661e2f43b36..c8c433dcfef3442ff8385c9fc1f1ea47
                          return true;
                          } // Paper - Add phantom creative and insomniac controls
 diff --git a/net/minecraft/world/level/NaturalSpawner.java b/net/minecraft/world/level/NaturalSpawner.java
-index 717cd4b18da2c637fc070c738741f926649b097f..dfb85696affef368d85f93cb0b465abb88267aa1 100644
+index 6da302e1dd755217b82dbc10051324bc8b5d10c1..e333abe5bcdd0c571682550d43c7e88d9f6f3296 100644
 --- a/net/minecraft/world/level/NaturalSpawner.java
 +++ b/net/minecraft/world/level/NaturalSpawner.java
 @@ -90,7 +90,8 @@ public final class NaturalSpawner {
