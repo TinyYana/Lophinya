@@ -1,0 +1,20 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: TinyYana <yanasakuranight@gmail.com>
+Date: Wed, 5 Aug 2026 23:43:19 +0800
+Subject: [PATCH] Lophinya: exp - use RegionParallelRunner.entityListBuffer()
+ in the shadow-run pre-pass
+
+
+diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
+index 04e12c0ff83a8c1af1159ee881f42f06529e8aa5..9a9872b3d2ca72d168ae29be998906142da4cd9c 100644
+--- a/net/minecraft/server/level/ServerLevel.java
++++ b/net/minecraft/server/level/ServerLevel.java
+@@ -939,7 +939,7 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+             // see project-docs/evidence/20260805-region-parallel-phase-framework-design.md 7.
+             if (fun.bm.lophinya.parallel.RegionParallelConfig.SENSOR_SHADOW_ENABLED) {
+                 foliaProfiler.startTimer(ca.spottedleaf.leafprofiler.LProfilerRegistry.REGION_PARALLEL_SHADOW_RUN);
+-                final java.util.List<Entity> shadowBatch = new java.util.ArrayList<>();
++                final java.util.List<Entity> shadowBatch = fun.bm.lophinya.parallel.RegionParallelRunner.entityListBuffer();
+                 regionizedWorldData.forEachTickingEntity(e -> {
+                     if (!e.isRemoved() && e instanceof net.minecraft.world.entity.LivingEntity) {
+                         shadowBatch.add(e);
