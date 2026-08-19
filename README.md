@@ -3,6 +3,7 @@
 # Lophinya
 
 **讓既有 Paper／Spigot 插件用原本的 jar、設定與資料，直接在 Folia 上跑的核心相容墊片**
+## 後續維護將轉至LophineLabs的[Lecithin](https://github.com/LophineLabs/Lecithin)，歡迎有興趣的伺服器架設者前往使用
 
 `Paper` → `Folia` → [`Lophine`](https://github.com/LophineLabs/Lophine) → `Lophinya`
 
